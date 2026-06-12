@@ -16,6 +16,8 @@ disallowed-tools: AskUserQuestion Edit Write
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex --phase review
 ```
 
-3. Read the generated `.ai/autonomous-development/review-NN.codex.json`.
+3. Read the generated review file. Its path is printed by the controller; you can also find it
+   via `controller.py status --json` under `reviews[-1].path` (resolved relative to the run
+   directory reported by `controller.py show-run`).
 4. Summarize the verdict and findings by severity with exact file evidence.
 5. Do not edit product files. Finding triage and repairs belong to `/autonomous-development:fix-findings`.

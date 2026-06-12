@@ -9,7 +9,9 @@ disallowed-tools: AskUserQuestion
 
 # Triage and fix review findings
 
-1. Read the latest `.ai/autonomous-development/review-NN.codex.json` and prior triage files.
+1. Locate the latest review file and any prior triage files. Use `controller.py status --json`
+   to find `reviews[-1].path` (resolved relative to the run directory), or run
+   `controller.py show-run` to inspect the full run state.
 2. Classify every finding as one of:
    - `accepted`;
    - `rejected_with_evidence`;

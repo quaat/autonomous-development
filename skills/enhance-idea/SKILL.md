@@ -22,5 +22,6 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --reuse --feature "$A
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex --phase enhance
 ```
 
-4. Read `.ai/autonomous-development/feature-spec.codex.json`.
+4. Read the Codex output. Its path is printed by the controller; you can also find it via
+   `controller.py status --json` under `artifacts.enhance`.
 5. Present a concise assessment of grounded requirements, assumptions, risky scope expansion, and blocking questions. Do not implement code in this skill.

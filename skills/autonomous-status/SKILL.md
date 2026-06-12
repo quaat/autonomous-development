@@ -20,4 +20,20 @@ When more detail is needed:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" status --json
 ```
 
-Explain the current phase, passing and failing checks, latest review verdict, remaining review budget, high-risk review requirement, and the next concrete action. Do not modify product files.
+When multiple runs exist for the repository, first list them:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" list-runs
+```
+
+Then inspect a specific run by ID:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" show-run --run-id <run-id>
+```
+
+Pass `--run-id <run-id>` to `status` as well when you need to target one run among several
+active ones.
+
+Explain the current phase, passing and failing checks, latest review verdict, remaining review
+budget, high-risk review requirement, and the next concrete action. Do not modify product files.

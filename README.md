@@ -80,25 +80,142 @@ make check
 claude plugin validate . --strict
 ```
 
-## State and generated artifacts
+## State location
 
-Each target repository receives a local run directory:
+State is stored outside the target repository by default. The resolver uses the following
+precedence:
 
-```text
-.ai/autonomous-development/
-├── run-state.json
-├── feature-request.md
-├── repository-context.txt
-├── feature-spec.codex.json
-├── accepted-spec.md
-├── implementation-plan.codex.json
-├── accepted-plan.md
-├── review-01.codex.json
-├── adversarial-01.codex.json
-└── verification/
+```bash
+# 1. Explicit state directory (highest priority)
+controller.py --state-dir /path/to/state init --feature "..."
+
+# 2. Environment variable
+export CLAUDE_AUTONOMOUS_STATE_HOME=~/.local/state/claude-autonomous
+controller.py init --feature "..."
+
+# 3. XDG default (Linux)
+# Automatically uses ~/.local/state/claude-autonomous/
+
+# 4. Legacy fallback (existing .ai/autonomous-development/ detected automatically)
 ```
 
-Add `.ai/` to the target repository's `.gitignore` unless the generated planning evidence should be committed.
+On macOS the default is `~/Library/Application Support/claude-autonomous/`.
+On Windows the default is `%LOCALAPPDATA%\claude-autonomous\`.
+
+## State and generated artifacts
+
+Each run is stored in its own directory under the state home:
+
+```text
+~/.local/state/claude-autonomous/
+├── repositories/
+│   └── <repo-id>/
+│       ├── metadata.json
+│       └── runs/
+│           └── <run-id>/
+│               ├── run-state.json
+│               ├── feature-request.md
+│               ├── repository-context.txt
+│               ├── accepted-spec.md
+│               ├── accepted-plan.md
+│               ├── feature-spec.codex.json
+│               ├── implementation-plan.codex.json
+│               ├── review-01.codex.json
+│               └── verification/
+```
+
+The legacy `.ai/autonomous-development/` layout is still supported for backward compatibility
+and is auto-detected when present. To suppress it, add `.ai/` to your `.gitignore` once you
+have migrated (see "Migration from legacy state" below) or if you never want to commit the
+planning evidence.
+
+## Multiple runs and run IDs
+
+Each `init` creates a new run with a collision-resistant run ID of the form
+`<YYYYMMDDTHHMMSSZ>-<8-hex-chars>` (for example `20260612T134500Z-a1b2c3d4`).
+
+```bash
+# List all active runs for the current repository
+controller.py list-runs
+
+# Show details for a specific run
+controller.py show-run --run-id 20260612T134500Z-a1b2c3d4
+
+# Start a second concurrent run with an optional human-readable label
+controller.py init --feature "New feature" --label "experiment"
+
+# Run commands against a specific run when multiple are active
+controller.py status --run-id 20260612T134500Z-a1b2c3d4
+```
+
+When exactly one active run exists, `--run-id` is optional and the run is selected
+automatically. When multiple active runs exist, commands that mutate state require
+`--run-id` to avoid ambiguity.
+
+## Migration from legacy state
+
+```bash
+# Migrate existing .ai/autonomous-development/ state to the new external layout
+controller.py migrate-legacy-state
+
+# The original .ai/autonomous-development/ directory is preserved unchanged.
+# To use the migrated state, either:
+export CLAUDE_AUTONOMOUS_STATE_HOME=~/.local/state/claude-autonomous
+# or add .ai/ to your .gitignore and continue; legacy state remains accessible.
+```
+
+Migration is non-destructive and idempotent. Run it again with `--force` to overwrite an
+already-migrated run directory.
+
+## Drift detection and recovery
+
+The controller detects when the repository state diverges from the recorded baseline before
+any mutating command. Two kinds of drift are distinguished:
+
+- **EXPECTED**: HEAD has advanced on the same branch (commits were added). No action required.
+- **UNSAFE**: Branch changed, worktree path changed, or repository identity changed. Mutating
+  commands are blocked until the drift is acknowledged.
+
+```bash
+# If an unsafe drift is detected (e.g., branch changed), you will see:
+# error: Unsafe repository drift detected: branch changed: main -> experiment
+# Recovery: Run `accept-drift` to acknowledge and record the new baseline.
+
+controller.py accept-drift
+```
+
+## Archiving runs
+
+```bash
+# Archive a completed run (removes it from the default list-runs output)
+controller.py archive-run --run-id 20260612T134500Z-a1b2c3d4
+
+# Show all runs including archived ones
+controller.py list-runs --all
+```
+
+Archiving is a metadata flag; no files are deleted.
+
+## Security and permissions
+
+- State directories are created with mode `0o700` (owner-only) on POSIX systems.
+- Review artifacts and Codex responses may contain sensitive code, prompts, or design details.
+- Do not share state directories across users or store them on world-readable paths.
+- Remote URLs are stored with credentials stripped (the `user:pass@` portion is removed).
+
+## Worktree support
+
+All commands work correctly from any linked worktree. The repository identity is derived from
+the shared git object store so runs created in different worktrees belong to the same
+repository and are visible to `list-runs`.
+
+```bash
+# Create a linked worktree and run the workflow there
+git worktree add ../experiment feature-branch
+cd ../experiment
+controller.py init --feature "Experiment feature"
+# State stored under the same repository ID, new run ID
+```
 
 ## Completion rules
 
