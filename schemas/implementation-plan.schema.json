@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Implementation plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "current_state",
+    "architecture_decisions",
+    "implementation_steps",
+    "files_expected_to_change",
+    "data_and_api_changes",
+    "test_strategy",
+    "rollback_strategy",
+    "risks",
+    "non_goals",
+    "definition_of_done"
+  ],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1},
+    "current_state": {"type": "array", "items": {"type": "string"}},
+    "architecture_decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["decision", "rationale", "alternatives_rejected"],
+        "properties": {
+          "decision": {"type": "string"},
+          "rationale": {"type": "string"},
+          "alternatives_rejected": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "implementation_steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["order", "description", "files", "dependencies", "validation"],
+        "properties": {
+          "order": {"type": "integer", "minimum": 1},
+          "description": {"type": "string", "minLength": 1},
+          "files": {"type": "array", "items": {"type": "string"}},
+          "dependencies": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+          "validation": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "files_expected_to_change": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "change", "confidence"],
+        "properties": {
+          "path": {"type": "string"},
+          "change": {"type": "string"},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    },
+    "data_and_api_changes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["public_api", "data_model", "migration", "compatibility"],
+      "properties": {
+        "public_api": {"type": "array", "items": {"type": "string"}},
+        "data_model": {"type": "array", "items": {"type": "string"}},
+        "migration": {"type": "array", "items": {"type": "string"}},
+        "compatibility": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "test_strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unit", "integration", "end_to_end", "static_checks", "manual_or_runtime"],
+      "properties": {
+        "unit": {"type": "array", "items": {"type": "string"}},
+        "integration": {"type": "array", "items": {"type": "string"}},
+        "end_to_end": {"type": "array", "items": {"type": "string"}},
+        "static_checks": {"type": "array", "items": {"type": "string"}},
+        "manual_or_runtime": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "rollback_strategy": {"type": "array", "items": {"type": "string"}},
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["risk", "severity", "mitigation"],
+        "properties": {
+          "risk": {"type": "string"},
+          "severity": {"enum": ["critical", "high", "medium", "low"]},
+          "mitigation": {"type": "string"}
+        }
+      }
+    },
+    "non_goals": {"type": "array", "items": {"type": "string"}},
+    "definition_of_done": {"type": "array", "items": {"type": "string"}}
+  }
+}

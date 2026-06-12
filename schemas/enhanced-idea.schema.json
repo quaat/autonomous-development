@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Enhanced feature idea",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "title",
+    "problem_statement",
+    "user_outcomes",
+    "functional_requirements",
+    "non_functional_requirements",
+    "acceptance_criteria",
+    "assumptions",
+    "open_questions",
+    "risks",
+    "non_goals"
+  ],
+  "properties": {
+    "title": {"type": "string", "minLength": 1},
+    "problem_statement": {"type": "string", "minLength": 1},
+    "user_outcomes": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "functional_requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "requirement", "priority", "evidence"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^FR-[0-9]+$"},
+          "requirement": {"type": "string", "minLength": 1},
+          "priority": {"enum": ["must", "should", "could"]},
+          "evidence": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "non_functional_requirements": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "criterion", "verification"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^AC-[0-9]+$"},
+          "criterion": {"type": "string", "minLength": 1},
+          "verification": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "assumptions": {"type": "array", "items": {"type": "string"}},
+    "open_questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["question", "recommended_default", "blocking"],
+        "properties": {
+          "question": {"type": "string"},
+          "recommended_default": {"type": "string"},
+          "blocking": {"type": "boolean"}
+        }
+      }
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["risk", "severity", "mitigation"],
+        "properties": {
+          "risk": {"type": "string"},
+          "severity": {"enum": ["critical", "high", "medium", "low"]},
+          "mitigation": {"type": "string"}
+        }
+      }
+    },
+    "non_goals": {"type": "array", "items": {"type": "string"}}
+  }
+}

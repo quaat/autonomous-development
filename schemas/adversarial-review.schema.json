@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Adversarial architecture review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "summary", "threats", "failure_scenarios", "required_actions", "confidence"],
+  "properties": {
+    "verdict": {"enum": ["pass", "changes_required", "blocked"]},
+    "summary": {"type": "string"},
+    "threats": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "area", "scenario", "evidence", "mitigation"],
+        "properties": {
+          "severity": {"enum": ["critical", "high", "medium", "low"]},
+          "area": {"enum": ["authorization", "authentication", "data_loss", "migration", "concurrency", "retries", "privacy", "availability", "rollback", "external_api", "supply_chain", "other"]},
+          "scenario": {"type": "string"},
+          "evidence": {"type": "string"},
+          "mitigation": {"type": "string"}
+        }
+      }
+    },
+    "failure_scenarios": {"type": "array", "items": {"type": "string"}},
+    "required_actions": {"type": "array", "items": {"type": "string"}},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+  }
+}

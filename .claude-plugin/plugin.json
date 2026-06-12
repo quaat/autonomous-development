@@ -1,0 +1,17 @@
+{
+  "name": "autonomous-development",
+  "displayName": "Autonomous Claude + Codex Development",
+  "version": "0.1.0",
+  "description": "A bounded autonomous feature-development workflow in which Claude orchestrates implementation and Codex independently enhances, plans, and reviews the work.",
+  "author": {
+    "name": "Thomas Hagelien"
+  },
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "autonomous-development",
+    "code-review",
+    "implementation-planning"
+  ]
+}
