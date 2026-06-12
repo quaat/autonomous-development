@@ -9,11 +9,10 @@ disallowed-tools: AskUserQuestion
 
 # Implement the accepted plan
 
-Read:
-
-- `.ai/autonomous-development/accepted-spec.md`;
-- `.ai/autonomous-development/accepted-plan.md`;
-- repository instructions and relevant source/tests.
+Read the current run's accepted artifacts. Use `controller.py show-run` (or
+`controller.py status --json`) to find the paths under `artifacts.accepted_spec` and
+`artifacts.accepted_plan`, then read those files along with repository instructions and
+relevant source/tests.
 
 Then:
 

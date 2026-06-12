@@ -9,7 +9,10 @@ disallowed-tools: AskUserQuestion
 
 # Create an implementation plan
 
-1. Confirm `.ai/autonomous-development/accepted-spec.md` exists. When only the Codex proposal exists, reconcile it first and register it with `controller.py accept --kind spec`.
+1. Confirm an accepted spec exists. Use `controller.py status --json` and check
+   `artifacts.accepted_spec`, or run `controller.py show-run` to view the full run state.
+   When only the Codex proposal exists, reconcile it first and register it with
+   `controller.py accept --kind spec`.
 2. Inspect repository conventions and likely change locations independently.
 3. Run:
 
@@ -17,7 +20,8 @@ disallowed-tools: AskUserQuestion
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex --phase plan
 ```
 
-4. Validate `.ai/autonomous-development/implementation-plan.codex.json` against actual files and interfaces.
+4. Validate the plan output (path printed by the controller, or found via
+   `controller.py status --json` under `artifacts.plan`) against actual files and interfaces.
 5. Incorporate the optional emphasis: `$ARGUMENTS`.
 6. Write a concise accepted Markdown plan and register it:
 

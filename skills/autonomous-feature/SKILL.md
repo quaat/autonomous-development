@@ -60,7 +60,11 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" doctor
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" init --feature "$ARGUMENTS"
 ```
 
-When `doctor` reports a missing external prerequisite, mark the run blocked with the controller and report the exact missing prerequisite rather than bypassing it.
+`init` prints the path to `run-state.json` and the run ID. When multiple concurrent runs are
+active, pass `--run-id <run-id>` to all subsequent commands to target the correct run.
+
+When `doctor` reports a missing external prerequisite, mark the run blocked with the controller
+and report the exact missing prerequisite rather than bypassing it.
 
 ### 2. Enhance the idea with Codex
 
@@ -70,7 +74,9 @@ Run:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex --phase enhance
 ```
 
-Read `.ai/autonomous-development/feature-spec.codex.json`. Reconcile it against repository evidence and the user's actual idea:
+Read the Codex output path printed by the controller (or use
+`controller.py status --json` to find `artifacts.enhance`). Reconcile it against repository
+evidence and the user's actual idea:
 
 - accept grounded requirements;
 - choose safe recommended defaults for non-blocking ambiguity;
@@ -92,7 +98,10 @@ Run a fresh Codex execution:
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" codex --phase plan
 ```
 
-Read `.ai/autonomous-development/implementation-plan.codex.json`. Verify all file paths, assumptions, sequencing, migrations, public interfaces, and test commands against the repository. Produce a concise accepted plan with explicit acceptance-criterion coverage, then register it:
+Read the Codex output path printed by the controller (or use
+`controller.py status --json` to find `artifacts.plan`). Verify all file paths, assumptions,
+sequencing, migrations, public interfaces, and test commands against the repository. Produce a
+concise accepted plan with explicit acceptance-criterion coverage, then register it:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/controller.py" accept --kind plan --file <temporary-plan-file>

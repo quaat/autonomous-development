@@ -1,0 +1,655 @@
+"""Shared state module for the autonomous-development plugin."""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import secrets
+import subprocess
+import sys
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+STATE_SCHEMA_VERSION = 2
+TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"complete", "blocked", "cancelled", "archived"}
+)
+LEGACY_STATE_REL = Path(".ai/autonomous-development")
+LEGACY_STATE_FILE_NAME = "run-state.json"
+
+
+class StateError(RuntimeError):
+    """User-actionable state error with a clear message."""
+
+
+# ---------------------------------------------------------------------------
+# Repository discovery
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RepoInfo:
+    """Snapshot of a git repository's identity and current state."""
+
+    id: str
+    canonical_root: Path
+    git_common_dir: Path
+    worktree_path: Path
+    branch: str
+    head_commit: str
+    display_name: str
+    remote_display: str
+
+
+def _run_git(*args: str, cwd: Path) -> str:
+    """Run a git command and return stripped stdout; return '' on failure."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except FileNotFoundError:
+        return ""
+
+
+def _strip_credentials(url: str) -> str:
+    """Remove userinfo (user:pass@ or token@) from a URL using url parsing."""
+    try:
+        parsed = urlsplit(url)
+        if parsed.username:
+            host = parsed.hostname or ""
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            return urlunsplit(
+                (parsed.scheme, host, parsed.path, parsed.query, parsed.fragment)
+            )
+    except Exception:
+        pass
+    return url
+
+
+def _compute_repo_id(git_common_dir: Path, first_commit: str) -> str:
+    """Compute a stable 16-char hex repo ID."""
+    key = str(git_common_dir.resolve()) + "\n" + first_commit
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+def resolve_repository(start: Path | None = None) -> RepoInfo:
+    """Find git repository from start (or cwd). Raises StateError if not in a git repo."""
+    cwd = (start or Path.cwd()).resolve()
+
+    toplevel = _run_git("rev-parse", "--show-toplevel", cwd=cwd)
+    if not toplevel:
+        raise StateError(
+            f"{cwd} is not inside a git repository. "
+            "Run this command from within a git worktree."
+        )
+    canonical_root = Path(toplevel).resolve()
+
+    raw_common = _run_git("rev-parse", "--git-common-dir", cwd=canonical_root)
+    if raw_common:
+        git_common_dir = (canonical_root / raw_common).resolve()
+    else:
+        git_common_dir = canonical_root
+
+    worktree_path = Path(
+        _run_git("rev-parse", "--show-toplevel", cwd=cwd) or toplevel
+    ).resolve()
+
+    branch = _run_git("branch", "--show-current", cwd=canonical_root)
+    head_commit = _run_git("rev-parse", "HEAD", cwd=canonical_root)
+
+    first_commit = _run_git("rev-list", "--max-parents=0", "HEAD", cwd=canonical_root)
+
+    if raw_common:
+        repo_id = _compute_repo_id(git_common_dir, first_commit)
+    else:
+        key = str(canonical_root) + "\n" + first_commit
+        repo_id = hashlib.sha256(key.encode()).hexdigest()[:16]
+
+    remote_raw = _run_git("remote", "get-url", "origin", cwd=canonical_root)
+    if not remote_raw:
+        remotes_v = _run_git("remote", "-v", cwd=canonical_root)
+        first_line = remotes_v.splitlines()[0] if remotes_v else ""
+        parts = first_line.split()
+        remote_raw = parts[1] if len(parts) >= 2 else ""
+    remote_display = _strip_credentials(remote_raw) if remote_raw else ""
+
+    return RepoInfo(
+        id=repo_id,
+        canonical_root=canonical_root,
+        git_common_dir=git_common_dir,
+        worktree_path=worktree_path,
+        branch=branch,
+        head_commit=head_commit,
+        display_name=canonical_root.name,
+        remote_display=remote_display,
+    )
+
+
+# ---------------------------------------------------------------------------
+# State home resolver
+# ---------------------------------------------------------------------------
+
+
+def resolve_state_home(state_dir_arg: str | None = None) -> Path:
+    """Precedence: CLI arg > CLAUDE_AUTONOMOUS_STATE_HOME env > XDG > ~/.local/state/claude-autonomous"""
+    if state_dir_arg:
+        return Path(state_dir_arg).expanduser().resolve()
+
+    env_val = os.environ.get("CLAUDE_AUTONOMOUS_STATE_HOME", "").strip()
+    if env_val:
+        return Path(env_val).expanduser().resolve()
+
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "claude-autonomous"
+
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        if local_app:
+            return Path(local_app) / "claude-autonomous"
+        return Path.home() / "AppData" / "Local" / "claude-autonomous"
+
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg:
+        return Path(xdg).expanduser().resolve() / "claude-autonomous"
+    return Path.home() / ".local" / "state" / "claude-autonomous"
+
+
+# ---------------------------------------------------------------------------
+# Run ID
+# ---------------------------------------------------------------------------
+
+
+def new_run_id() -> str:
+    """<YYYYMMDDTHHMMSSZ>-<secrets.token_hex(4)>"""
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{secrets.token_hex(4)}"
+
+
+# ---------------------------------------------------------------------------
+# Legacy state detection
+# ---------------------------------------------------------------------------
+
+
+def detect_legacy_state(repo_root: Path) -> Path | None:
+    """Return the legacy .ai/autonomous-development/ dir if run-state.json exists there, else None."""
+    legacy_dir = repo_root / LEGACY_STATE_REL
+    if (legacy_dir / LEGACY_STATE_FILE_NAME).exists():
+        return legacy_dir
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Path utilities
+# ---------------------------------------------------------------------------
+
+
+def run_dir_path(state_home: Path, repo_id: str, run_id: str) -> Path:
+    """<state_home>/repositories/<repo_id>/runs/<run_id>/"""
+    return state_home / "repositories" / repo_id / "runs" / run_id
+
+
+def repo_metadata_path(state_home: Path, repo_id: str) -> Path:
+    """<state_home>/repositories/<repo_id>/metadata.json"""
+    return state_home / "repositories" / repo_id / "metadata.json"
+
+
+def make_relative_path(absolute: Path, run_dir: Path) -> str:
+    """Return a relative path if absolute is inside run_dir; else return str(absolute)."""
+    try:
+        rel = absolute.resolve().relative_to(run_dir.resolve())
+        parts = rel.parts
+        if parts and parts[0] == "..":
+            return str(absolute)
+        return str(rel)
+    except ValueError:
+        return str(absolute)
+
+
+def resolve_artifact_path(relative_or_abs: str, run_dir: Path) -> Path:
+    """Resolve relative to absolute. Reject '..' traversal outside run_dir."""
+    p = Path(relative_or_abs)
+    if p.is_absolute():
+        return p
+    resolved = (run_dir / p).resolve()
+    try:
+        resolved.relative_to(run_dir.resolve())
+    except ValueError:
+        raise StateError(f"Artifact path escapes run directory: {relative_or_abs!r}")
+    return resolved
+
+
+# ---------------------------------------------------------------------------
+# Atomic write and locking
+# ---------------------------------------------------------------------------
+
+
+def atomic_write_json(path: Path, value: dict) -> None:
+    """Write to a .tmp file then replace atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(
+        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    temp.replace(path)
+
+
+class RunStateLock:
+    """Context manager for exclusive file lock on a run's lock file."""
+
+    def __init__(self, run_dir: Path) -> None:
+        self._lock_path = run_dir / ".run-state.lock"
+        self._fd: int | None = None
+
+    def __enter__(self) -> RunStateLock:
+        run_dir = self._lock_path.parent
+        run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except ImportError:
+            pass  # best-effort on platforms without fcntl
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        if self._fd is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self._fd, fcntl.LOCK_UN)
+            except ImportError:
+                pass
+            os.close(self._fd)
+            self._fd = None
+
+
+# ---------------------------------------------------------------------------
+# State schema validation
+# ---------------------------------------------------------------------------
+
+
+def validate_state(state: dict) -> None:
+    """Validate loaded state dict. Raises StateError on schema problems."""
+    if not isinstance(state, dict):
+        raise StateError("State must be a JSON object.")
+
+    if "status" not in state:
+        raise StateError("State is missing required field 'status'.")
+    if not isinstance(state["status"], str):
+        raise StateError("State field 'status' must be a string.")
+
+    if "run_id" not in state:
+        raise StateError("State is missing required field 'run_id'.")
+    if not isinstance(state["run_id"], str):
+        raise StateError("State field 'run_id' must be a string.")
+
+    schema_version = state.get("schema_version") or state.get("version")
+    if schema_version is not None and schema_version not in (1, 2):
+        raise StateError(
+            f"Unsupported schema_version {schema_version!r}. "
+            "Supported versions are 1 (legacy) and 2. "
+            "Run `migrate-legacy-state` to upgrade."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Schema migration v1 → v2
+# ---------------------------------------------------------------------------
+
+
+def _remap_path(p: Path, legacy_dir: Path | None, run_dir: Path) -> str:
+    """Convert a legacy absolute path to a run-dir-relative path.
+
+    If the path is under legacy_dir, produce the relative path assuming the file
+    was copied to the equivalent location under run_dir.  Fallback: try to relativize
+    against run_dir directly.  Return the original absolute path string only as a last resort.
+    """
+    if legacy_dir is not None:
+        try:
+            rel_to_legacy = p.resolve().relative_to(legacy_dir.resolve())
+            return str(rel_to_legacy)
+        except ValueError:
+            pass
+    return make_relative_path(p, run_dir)
+
+
+def migrate_v1_to_v2(
+    legacy_state: dict,
+    run_dir: Path,
+    repo: RepoInfo,
+    legacy_dir: Path | None = None,
+) -> dict:
+    """Convert a v1/legacy state dict to v2 format in-memory."""
+    state = dict(legacy_state)
+
+    state.pop("version", None)
+    state["schema_version"] = 2
+
+    if "run_id" not in state:
+        state["run_id"] = new_run_id()
+
+    state["repository"] = {
+        "id": repo.id,
+        "display_name": repo.display_name,
+        "canonical_root": str(repo.canonical_root),
+        "remote_display": repo.remote_display,
+    }
+
+    baseline = state.get("baseline", {})
+    if not isinstance(baseline, dict):
+        baseline = {}
+    if "branch" not in baseline:
+        baseline["branch"] = repo.branch
+    if "worktree_path" not in baseline:
+        baseline["worktree_path"] = str(repo.worktree_path)
+    state["baseline"] = baseline
+
+    artifacts = state.get("artifacts", {})
+    if isinstance(artifacts, dict):
+        new_artifacts: dict[str, object] = {}
+        for key, value in artifacts.items():
+            if isinstance(value, str):
+                p = Path(value)
+                if p.is_absolute():
+                    new_artifacts[key] = _remap_path(p, legacy_dir, run_dir)
+                else:
+                    new_artifacts[key] = value
+            else:
+                new_artifacts[key] = value
+        state["artifacts"] = new_artifacts
+
+    for list_key in ("reviews", "adversarial_reviews"):
+        entries = state.get(list_key, [])
+        if isinstance(entries, list):
+            updated_entries = []
+            for entry in entries:
+                if isinstance(entry, dict) and "path" in entry:
+                    p = Path(entry["path"])
+                    if p.is_absolute():
+                        entry = dict(entry)
+                        entry["path"] = _remap_path(p, legacy_dir, run_dir)
+                updated_entries.append(entry)
+            state[list_key] = updated_entries
+
+    checks = state.get("verification", {}).get("checks", [])
+    if isinstance(checks, list):
+        updated_checks = []
+        for check in checks:
+            if isinstance(check, dict) and "log" in check:
+                p = Path(check["log"])
+                if p.is_absolute():
+                    check = dict(check)
+                    check["log"] = _remap_path(p, legacy_dir, run_dir)
+            updated_checks.append(check)
+        if "verification" in state and isinstance(state["verification"], dict):
+            state["verification"]["checks"] = updated_checks
+
+    state.setdefault("migrated_from", "v1")
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Run state loading / saving
+# ---------------------------------------------------------------------------
+
+_STATE_FILE_NAME = "run-state.json"
+
+
+def load_run_state(run_dir: Path, required: bool = True) -> dict:
+    """Load and validate run-state.json from run_dir. Returns {} if not found and not required."""
+    path = run_dir / _STATE_FILE_NAME
+    if not path.exists():
+        if required:
+            raise StateError(f"No run-state.json found at {path}")
+        return {}
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateError(f"Invalid run state at {path}: {exc}") from exc
+    if not isinstance(state, dict):
+        raise StateError(f"Run state must be a JSON object: {path}")
+    validate_state(state)
+    return state
+
+
+def save_run_state(run_dir: Path, state: dict) -> None:
+    """Add updated_at timestamp and atomically write run-state.json."""
+    state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    atomic_write_json(run_dir / _STATE_FILE_NAME, state)
+
+
+# ---------------------------------------------------------------------------
+# Repo metadata
+# ---------------------------------------------------------------------------
+
+
+def load_repo_metadata(state_home: Path, repo_id: str) -> dict:
+    """Load repositories/<repo_id>/metadata.json or return {}."""
+    path = repo_metadata_path(state_home, repo_id)
+    if not path.exists():
+        return {}
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def save_repo_metadata(state_home: Path, repo_id: str, meta: dict) -> None:
+    """Save repositories/<repo_id>/metadata.json atomically."""
+    atomic_write_json(repo_metadata_path(state_home, repo_id), meta)
+
+
+# ---------------------------------------------------------------------------
+# Run discovery and selection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RunRef:
+    """Reference to a discovered run with its loaded state."""
+
+    run_id: str
+    run_dir: Path
+    state: dict
+
+
+def find_active_runs(state_home: Path, repo_id: str) -> list[RunRef]:
+    """Return all non-terminal runs for this repository."""
+    return [
+        r
+        for r in find_all_runs(state_home, repo_id)
+        if r.state.get("status") not in TERMINAL_STATUSES
+    ]
+
+
+def find_all_runs(state_home: Path, repo_id: str) -> list[RunRef]:
+    """Return all runs (active + archived + terminal) for this repository."""
+    runs_dir = state_home / "repositories" / repo_id / "runs"
+    if not runs_dir.is_dir():
+        return []
+    refs: list[RunRef] = []
+    for child in sorted(runs_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        state = load_run_state(child, required=False)
+        if not state:
+            continue
+        run_id = state.get("run_id", child.name)
+        refs.append(RunRef(run_id=run_id, run_dir=child, state=state))
+    return refs
+
+
+def resolve_active_run(
+    state_home: Path,
+    repo_id: str,
+    repo_root: Path,
+    run_id: str | None = None,
+    *,
+    allow_multiple: bool = False,
+) -> RunRef:
+    """Resolve the run to operate on."""
+    if run_id is not None:
+        runs_dir = state_home / "repositories" / repo_id / "runs"
+        run_dir = runs_dir / run_id
+        state = load_run_state(run_dir, required=True)
+        return RunRef(run_id=run_id, run_dir=run_dir, state=state)
+
+    active = find_active_runs(state_home, repo_id)
+
+    if len(active) == 1:
+        return active[0]
+
+    if len(active) > 1:
+        if allow_multiple:
+            return active[0]
+        ids = ", ".join(r.run_id for r in active)
+        raise StateError(
+            f"Multiple active runs found: {ids}. "
+            "Specify one with --run-id <run_id> or use `list-runs` to review them."
+        )
+
+    legacy_dir = detect_legacy_state(repo_root)
+    if legacy_dir is not None:
+        legacy_path = legacy_dir / LEGACY_STATE_FILE_NAME
+        try:
+            legacy_state = json.loads(legacy_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise StateError(f"Invalid legacy state at {legacy_path}: {exc}") from exc
+        if not isinstance(legacy_state, dict):
+            raise StateError(f"Legacy state must be a JSON object: {legacy_path}")
+        run_id_val = legacy_state.get("run_id", "legacy")
+        print(
+            f"[autonomous-development] DEPRECATION: Using legacy state at {legacy_dir}. "
+            "Run `controller.py migrate-legacy-state` to upgrade to the portable layout.",
+            file=sys.stderr,
+        )
+        return RunRef(run_id=run_id_val, run_dir=legacy_dir, state=legacy_state)
+
+    raise StateError(
+        "No active workflow run found. "
+        'Run `controller.py init --feature "..."` to start a new run, '
+        "or `list-runs` to see all runs."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drift detection
+# ---------------------------------------------------------------------------
+
+
+class DriftKind(Enum):
+    """Classification of repository drift relative to a recorded baseline."""
+
+    NONE = "none"
+    EXPECTED = "expected"
+    UNSAFE = "unsafe"
+
+
+@dataclass
+class DriftResult:
+    """Result of a drift detection check."""
+
+    kind: DriftKind
+    message: str
+    recovery: str
+
+
+def detect_drift(state: dict, repo: RepoInfo) -> DriftResult:
+    """Check for drift between recorded baseline and current repo state."""
+    repo_block = state.get("repository", {})
+    baseline = state.get("baseline", {})
+
+    if isinstance(repo_block, dict) and repo_block.get("id"):
+        recorded_repo_id = repo_block["id"]
+        if recorded_repo_id != repo.id:
+            return DriftResult(
+                kind=DriftKind.UNSAFE,
+                message=(
+                    f"Repository identity changed: recorded {recorded_repo_id!r}, "
+                    f"current {repo.id!r}."
+                ),
+                recovery=(
+                    "You appear to be in a different repository. "
+                    "Switch to the correct repository or use `list-runs` to find the right run."
+                ),
+            )
+
+    if isinstance(baseline, dict):
+        recorded_worktree = baseline.get("worktree_path", "")
+        if recorded_worktree and str(repo.worktree_path) != recorded_worktree:
+            return DriftResult(
+                kind=DriftKind.UNSAFE,
+                message=(
+                    f"Worktree changed: recorded {recorded_worktree!r}, "
+                    f"current {str(repo.worktree_path)!r}."
+                ),
+                recovery=(
+                    "Switch to the recorded worktree or run `accept-drift` "
+                    "to record the new worktree as the baseline."
+                ),
+            )
+
+        recorded_branch = baseline.get("branch", "")
+        if recorded_branch and repo.branch != recorded_branch:
+            return DriftResult(
+                kind=DriftKind.UNSAFE,
+                message=(
+                    f"Branch changed: recorded {recorded_branch!r}, "
+                    f"current {repo.branch!r}."
+                ),
+                recovery=(
+                    f"Switch back to branch {recorded_branch!r} or run `accept-drift` "
+                    "to record the new branch as the baseline."
+                ),
+            )
+
+        recorded_commit = baseline.get("commit", "")
+        if recorded_commit and repo.head_commit and repo.head_commit != recorded_commit:
+            return DriftResult(
+                kind=DriftKind.EXPECTED,
+                message=(
+                    f"HEAD advanced from {recorded_commit[:12]!r} "
+                    f"to {repo.head_commit[:12]!r} on branch {repo.branch!r}."
+                ),
+                recovery="No action required; HEAD advancing on the same branch is expected.",
+            )
+
+    return DriftResult(
+        kind=DriftKind.NONE,
+        message="No drift detected.",
+        recovery="",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Repository context string
+# ---------------------------------------------------------------------------
+
+
+def repository_context(repo: RepoInfo) -> str:
+    """Return a human-readable summary of the repository for inclusion in Codex prompts."""
+    tracked = _run_git("ls-files", cwd=repo.canonical_root)
+    top_files = "\n".join(tracked.splitlines()[:250])
+    status = _run_git("status", "--short", cwd=repo.canonical_root)
+    remotes = _run_git("remote", "-v", cwd=repo.canonical_root)
+    return (
+        f"Repository: {repo.display_name}\n"
+        f'Branch: {repo.branch or "(detached)"}\n'
+        f'HEAD: {repo.head_commit or "(unknown)"}\n'
+        f'Working tree status:\n{status or "(clean)"}\n\n'
+        f'Remotes (informational only; workflow must not push):\n{remotes or "(none)"}\n\n'
+        f'First tracked files (maximum 250):\n{top_files or "(none)"}\n'
+    )
