@@ -1,9 +1,11 @@
 """Structured-payload validation against the bundled JSON Schemas.
 
-Every structured boundary the controller trusts — Codex enhance/plan/review
-outputs, reconciliation decisions, triage ledgers, and persisted run state — is
-validated here against a bundled Draft 2020-12 schema *before* it is published
-to a canonical artifact or merged into run state.
+The structured boundaries the controller currently validates here against a
+bundled Draft 2020-12 schema — *before* the payload is published to a canonical
+artifact or merged into run state — are the Codex enhance/plan/review outputs,
+the reconciliation source and decision delta, and the triage ledger.
+(Persisted run-state validation is not wired through this module yet; it is
+deferred until the run-state schema is finalized.)
 
 Design invariants:
 
@@ -75,11 +77,21 @@ def _load_validator(schema_rel: str):
     return cls(schema)
 
 
+def _escape_token(token: Any) -> str:
+    """Escape a single JSON Pointer reference token per RFC 6901.
+
+    ``~`` becomes ``~0`` and ``/`` becomes ``~1`` (and ``~`` must be escaped
+    first, or a literal ``/`` would be double-encoded). Without this, a property
+    name containing ``/`` or ``~`` would render an ambiguous pointer.
+    """
+    return str(token).replace("~", "~0").replace("/", "~1")
+
+
 def _pointer(path: Any) -> str:
     parts = list(path)
     if not parts:
         return "(root)"
-    return "/" + "/".join(str(part) for part in parts)
+    return "/" + "/".join(_escape_token(part) for part in parts)
 
 
 def validate_payload(payload: Any, schema_rel: str, *, label: str | None = None) -> None:

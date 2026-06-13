@@ -65,10 +65,17 @@ def main() -> int:
 
     version = _check_version_consistency(manifest)
 
+    # Every bundled schema must declare a recognized top-level JSON Schema type.
+    # Codex output schemas are objects; input-validation schemas may also be
+    # arrays (e.g. the triage ledger), so allow any valid primitive type here and
+    # enforce object-strictness only for the output schemas below.
+    valid_types = {
+        "object", "array", "string", "number", "integer", "boolean", "null",
+    }
     for schema in sorted((ROOT / "schemas").glob("*.json")):
         parsed = json.loads(schema.read_text(encoding="utf-8"))
-        if parsed.get("type") != "object":
-            fail(f"{schema} must define an object schema")
+        if parsed.get("type") not in valid_types:
+            fail(f"{schema} must declare a valid top-level JSON Schema `type`")
 
     # Codex `--output-schema` runs under OpenAI strict structured outputs, which
     # require every object's `required` array to list every key in `properties`.

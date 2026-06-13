@@ -29,6 +29,7 @@ from state import (
     make_relative_path,
     resolve_artifact_path,
     RunStateLock,
+    RepoInitLock,
     migrate_v1_to_v2,
     load_run_state,
     save_run_state,
@@ -858,6 +859,22 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         if path is None:
             failures.append(f"{executable} is not installed or not on PATH")
 
+    # jsonschema is a declared runtime dependency: every Codex output, the
+    # reconciliation source/decisions, and the triage ledger are validated
+    # against the bundled schemas before they can affect run state. Without it
+    # those structural gates cannot run, so surface a missing install here.
+    try:
+        import jsonschema  # noqa: F401
+
+        jsonschema_version = getattr(jsonschema, "__version__", "unknown")
+        print(f"jsonschema: {jsonschema_version}")
+    except ImportError:
+        print("jsonschema: not found")
+        failures.append(
+            "jsonschema is not installed; install the package dependencies "
+            "(e.g. `pip install -e .` or `pip install 'jsonschema>=4.18'`)"
+        )
+
     # Verify via resolve_repository as well as raw git check
     inside = git(start, "rev-parse", "--is-inside-work-tree", check=False)
     print(f'Git repository: {inside == "true"}')
@@ -912,112 +929,124 @@ def cmd_init(args: argparse.Namespace) -> int:
         raw_label = args.label.strip()
         label = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw_label).strip("-").lower()[:80]
 
-    active_runs = find_active_runs(state_home, repo.id)
+    # Serialize the active-run check and run creation per repository. With
+    # generated IDs two concurrent inits pick different run IDs, so the per-run
+    # RunStateLock cannot serialize them; without this repo-level lock both could
+    # observe "no active run" and each create one. The loser sees the winner's
+    # active run and fails closed (unless --force authorizes an additional run).
+    with RepoInitLock(state_home, repo.id):
+        active_runs = find_active_runs(state_home, repo.id)
 
-    if active_runs:
-        if args.reuse:
-            if len(active_runs) > 1:
+        if active_runs:
+            if args.reuse:
+                if len(active_runs) > 1:
+                    ids = ", ".join(r.run_id for r in active_runs)
+                    raise WorkflowError(
+                        f"Multiple active runs exist: {ids}. "
+                        "Use --run-id to select one explicitly."
+                    )
+                run_ref = active_runs[0]
+                run_dir = run_ref.run_dir
+                state_path = run_dir / "run-state.json"
+                print(state_path)
+                return 0
+            if not args.force:
                 ids = ", ".join(r.run_id for r in active_runs)
                 raise WorkflowError(
-                    f"Multiple active runs exist: {ids}. "
-                    "Use --run-id to select one explicitly."
+                    f"Active workflow run(s) already exist: {ids}. "
+                    "Use `status`, `cancel`, `--reuse`, or `--force`."
                 )
-            run_ref = active_runs[0]
-            run_dir = run_ref.run_dir
-            state_path = run_dir / "run-state.json"
-            print(state_path)
-            return 0
-        if not args.force:
-            ids = ", ".join(r.run_id for r in active_runs)
-            raise WorkflowError(
-                f"Active workflow run(s) already exist: {ids}. "
-                "Use `status`, `cancel`, `--reuse`, or `--force`."
-            )
 
-    run_id = run_id_override or new_run_id()
-    run_dir = run_dir_path(state_home, repo.id, run_id)
+        run_id = run_id_override or new_run_id()
+        run_dir = run_dir_path(state_home, repo.id, run_id)
 
-    # Never overwrite an existing run, active or terminal. `--force` may create an
-    # additional run while another is active (handled above); it must not
-    # authorize clobbering an existing run ID's state.
-    if (run_dir / "run-state.json").exists():
-        raise WorkflowError(
-            f"A run with ID {run_id!r} already exists at {run_dir}. Refusing to "
-            "overwrite it. Use a different --run-id, `--reuse` to continue an "
-            "active run, or `archive-run`/`list-runs` to manage existing runs."
-        )
-
-    with RunStateLock(run_dir):
-        # Re-check under the lock to close the TOCTOU window against a concurrent
-        # init creating the same run ID first.
+        # Never overwrite an existing run, active or terminal. `--force` may create
+        # an additional run while another is active (handled above); it must not
+        # authorize clobbering an existing run ID's state.
         if (run_dir / "run-state.json").exists():
             raise WorkflowError(
-                f"A run with ID {run_id!r} already exists at {run_dir}. "
-                "Refusing to overwrite it."
-            )
-        run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-        ctx_text = repository_context(repo)
-        (run_dir / "feature-request.md").write_text(feature + "\n", encoding="utf-8")
-        (run_dir / "repository-context.txt").write_text(ctx_text, encoding="utf-8")
-
-        dirty = git(repo.canonical_root, "status", "--short", check=False).splitlines()
-
-        requested_mode = getattr(args, "mode", "auto")
-        effective_mode, mode_reasons = select_mode(requested_mode, feature)
-        # `auto`/explicit rigorous runs are safety-sensitive: require adversarial review.
-        risk_reasons: list[str] = []
-        requires_adversarial = effective_mode == "rigorous"
-        if requires_adversarial:
-            risk_reasons.append(
-                f"{effective_mode} mode selected (requested={requested_mode})"
+                f"A run with ID {run_id!r} already exists at {run_dir}. Refusing to "
+                "overwrite it. Use a different --run-id, `--reuse` to continue an "
+                "active run, or `archive-run`/`list-runs` to manage existing runs."
             )
 
-        state: dict[str, Any] = {
-            "schema_version": 2,
-            "run_id": run_id,
-            "label": label,
-            "feature": feature,
-            "status": "active",
-            "phase": "initialized",
-            "created_at": utc_now(),
-            "updated_at": utc_now(),
-            "repository": {
-                "id": repo.id,
-                "canonical_root": str(repo.canonical_root),
-                "git_common_dir": str(repo.git_common_dir),
-                "worktree_path": str(repo.worktree_path),
-                "display_name": repo.display_name,
-                "remote_display": repo.remote_display,
-            },
-            "baseline": {
-                "commit": repo.head_commit,
-                "branch": repo.branch,
-                "dirty_entries_at_init": dirty,
-            },
-            "requested_mode": requested_mode,
-            "effective_mode": effective_mode,
-            "mode_reasons": mode_reasons,
-            "max_review_rounds": args.max_review_rounds,
-            "review_round": 0,
-            "stop_gate_blocks": 0,
-            "artifacts": {
-                "feature_request": "feature-request.md",
-                "repository_context": "repository-context.txt",
-            },
-            "verification": {"checks": [], "passed": False},
-            "reviews": [],
-            "adversarial_reviews": [],
-            "cumulative_findings": [],
-            "review_ledger": [],
-            "codex_runs": [],
-            "risk": {
-                "requires_adversarial_review": requires_adversarial,
-                "reasons": risk_reasons,
-            },
-            "notes": [],
-        }
-        save_run_state(run_dir, state)
+        with RunStateLock(run_dir):
+            # Re-check under the lock to close the TOCTOU window against a concurrent
+            # init creating the same run ID first.
+            if (run_dir / "run-state.json").exists():
+                raise WorkflowError(
+                    f"A run with ID {run_id!r} already exists at {run_dir}. "
+                    "Refusing to overwrite it."
+                )
+            run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+            ctx_text = repository_context(repo)
+            (run_dir / "feature-request.md").write_text(
+                feature + "\n", encoding="utf-8"
+            )
+            (run_dir / "repository-context.txt").write_text(
+                ctx_text, encoding="utf-8"
+            )
+
+            dirty = git(
+                repo.canonical_root, "status", "--short", check=False
+            ).splitlines()
+
+            requested_mode = getattr(args, "mode", "auto")
+            effective_mode, mode_reasons = select_mode(requested_mode, feature)
+            # `auto`/explicit rigorous runs are safety-sensitive: require adversarial.
+            risk_reasons: list[str] = []
+            requires_adversarial = effective_mode == "rigorous"
+            if requires_adversarial:
+                risk_reasons.append(
+                    f"{effective_mode} mode selected (requested={requested_mode})"
+                )
+
+            state: dict[str, Any] = {
+                "schema_version": 2,
+                "run_id": run_id,
+                "label": label,
+                "feature": feature,
+                "status": "active",
+                "phase": "initialized",
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+                "repository": {
+                    "id": repo.id,
+                    "canonical_root": str(repo.canonical_root),
+                    "git_common_dir": str(repo.git_common_dir),
+                    "worktree_path": str(repo.worktree_path),
+                    "display_name": repo.display_name,
+                    "remote_display": repo.remote_display,
+                },
+                "baseline": {
+                    "commit": repo.head_commit,
+                    "branch": repo.branch,
+                    "dirty_entries_at_init": dirty,
+                },
+                "requested_mode": requested_mode,
+                "effective_mode": effective_mode,
+                "mode_reasons": mode_reasons,
+                "max_review_rounds": args.max_review_rounds,
+                "review_round": 0,
+                "stop_gate_blocks": 0,
+                "artifacts": {
+                    "feature_request": "feature-request.md",
+                    "repository_context": "repository-context.txt",
+                },
+                "verification": {"checks": [], "passed": False},
+                "reviews": [],
+                "adversarial_reviews": [],
+                "cumulative_findings": [],
+                "review_ledger": [],
+                "codex_runs": [],
+                "risk": {
+                    "requires_adversarial_review": requires_adversarial,
+                    "reasons": risk_reasons,
+                },
+                "notes": [],
+            }
+            save_run_state(run_dir, state)
 
     # Save repo metadata
     meta = load_repo_metadata(state_home, repo.id)
@@ -1686,8 +1715,12 @@ def cmd_accept(args: argparse.Namespace) -> int:
     md_name = "accepted-spec.md" if kind == "spec" else "accepted-plan.md"
     json_name = "accepted-spec.json" if kind == "spec" else "accepted-plan.json"
     destination = run_dir / md_name
-    wrote_json = False
 
+    # Build the artifact content in memory OUTSIDE the lock. Nothing is written to
+    # a canonical path here, so a failure (bad input, cancellation) cannot leave a
+    # half-written accepted-spec.md or a stale accepted-spec.json behind.
+    md_text: str
+    json_text: str | None = None
     if getattr(args, "decisions", None):
         if not getattr(args, "source", None):
             raise WorkflowError("--decisions requires --source <codex-json>")
@@ -1704,41 +1737,75 @@ def cmd_accept(args: argparse.Namespace) -> int:
             ) from exc
         if not isinstance(source_obj, dict) or not isinstance(decisions, dict):
             raise WorkflowError("Source and decisions must each be a JSON object")
-        accepted_obj, md_text = materialize_acceptance(kind, source_obj, decisions)
-        (run_dir / json_name).write_text(
-            json.dumps(accepted_obj, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        # Fully validate the structured acceptance source against its phase
+        # schema before materializing: the accepted artifact becomes the contract
+        # that downstream review and the completion gate are judged against, so a
+        # malformed/wrong-shaped source (mistyped sections, bad FR-/AC- ids,
+        # missing evidence) must be rejected, not silently degraded.
+        source_schema = (
+            "schemas/enhanced-idea.schema.json"
+            if kind == "spec"
+            else "schemas/implementation-plan.schema.json"
         )
-        destination.write_text(md_text, encoding="utf-8")
-        wrote_json = True
+        try:
+            validate_payload(
+                source_obj,
+                source_schema,
+                label=f"Reconciliation source for kind '{kind}'",
+            )
+        except SchemaValidationError as exc:
+            raise WorkflowError(str(exc)) from exc
+        accepted_obj, md_text = materialize_acceptance(kind, source_obj, decisions)
+        json_text = json.dumps(accepted_obj, indent=2, sort_keys=True) + "\n"
     else:
         if not getattr(args, "file", None):
             raise WorkflowError("Provide either --file or --source with --decisions")
         source = Path(args.file).resolve()
         if not source.is_file():
             raise WorkflowError(f"Accepted artifact does not exist: {source}")
-        destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        md_text = source.read_text(encoding="utf-8")
 
-    accepted_risks = classify_feature_risk(destination.read_text(encoding="utf-8"))
+    accepted_risks = classify_feature_risk(md_text)
 
-    with RunStateLock(run_dir):
-        state = load_run_state(run_dir)
-        require_active_run_state(state, run_id, "accept")
-        state.setdefault("artifacts", {})[f"accepted_{kind}"] = md_name
-        if wrote_json:
-            state["artifacts"][f"accepted_{kind}_json"] = json_name
-        state["phase"] = "spec-accepted" if kind == "spec" else "plan-accepted"
-        # Risk is sticky upward: if the accepted artifact reveals high-risk scope
-        # that the initial feature text did not, escalate the adversarial gate.
-        # Never downgrade an already-required gate here.
-        risk = state.setdefault("risk", {})
-        if accepted_risks and not risk.get("requires_adversarial_review"):
-            risk["requires_adversarial_review"] = True
-            risk.setdefault("reasons", []).append(
-                f"accepted {kind} escalated to rigorous: detected "
-                f"{', '.join(accepted_risks)}"
-            )
-        state["stop_gate_blocks"] = 0
-        save_run_state(run_dir, state)
+    # Stage each artifact to an invocation-unique temp path on the same filesystem
+    # so it can be published with an atomic os.replace under the lock. If anything
+    # fails, the staged files are removed and the canonical artifacts and state
+    # remain byte-identical.
+    stage_token = uuid.uuid4().hex
+    staged: list[tuple[Path, Path]] = []  # (temp, canonical)
+    md_tmp = run_dir / f".{md_name}.{stage_token}.tmp"
+    md_tmp.write_text(md_text, encoding="utf-8")
+    staged.append((md_tmp, destination))
+    if json_text is not None:
+        json_tmp = run_dir / f".{json_name}.{stage_token}.tmp"
+        json_tmp.write_text(json_text, encoding="utf-8")
+        staged.append((json_tmp, run_dir / json_name))
+
+    try:
+        with RunStateLock(run_dir):
+            state = load_run_state(run_dir)
+            require_active_run_state(state, run_id, "accept")
+            for tmp_path, canonical_path in staged:
+                os.replace(tmp_path, canonical_path)
+            state.setdefault("artifacts", {})[f"accepted_{kind}"] = md_name
+            if json_text is not None:
+                state["artifacts"][f"accepted_{kind}_json"] = json_name
+            state["phase"] = "spec-accepted" if kind == "spec" else "plan-accepted"
+            # Risk is sticky upward: if the accepted artifact reveals high-risk
+            # scope that the initial feature text did not, escalate the adversarial
+            # gate. Never downgrade an already-required gate here.
+            risk = state.setdefault("risk", {})
+            if accepted_risks and not risk.get("requires_adversarial_review"):
+                risk["requires_adversarial_review"] = True
+                risk.setdefault("reasons", []).append(
+                    f"accepted {kind} escalated to rigorous: detected "
+                    f"{', '.join(accepted_risks)}"
+                )
+            state["stop_gate_blocks"] = 0
+            save_run_state(run_dir, state)
+    finally:
+        for tmp_path, _ in staged:
+            tmp_path.unlink(missing_ok=True)
     print(destination)
     return 0
 
@@ -2419,8 +2486,13 @@ def cmd_triage(args: argparse.Namespace) -> int:
         entries = json.loads(file_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise WorkflowError(f"Cannot read triage ledger: {exc}") from exc
-    if not isinstance(entries, list):
-        raise WorkflowError("Triage ledger must be a JSON array of entries")
+    # Validate the whole ledger BEFORE any disposition is applied: a malformed
+    # entry (missing fingerprint, unknown status) must not partially close
+    # cumulative findings or release the completion gate.
+    try:
+        validate_payload(entries, "schemas/triage.schema.json", label="Triage ledger")
+    except SchemaValidationError as exc:
+        raise WorkflowError(str(exc)) from exc
 
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)

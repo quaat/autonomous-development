@@ -39,9 +39,23 @@ The plugin deliberately keeps Claude as the implementation orchestrator and uses
 
 - Claude Code with plugin and skill support.
 - Python 3.11 or later.
+- The `jsonschema` Python package (>=4.18), a declared runtime dependency used
+  to validate every Codex output, reconciliation source/decision, and triage
+  ledger before it can affect run state.
 - Git.
 - Codex CLI installed and authenticated.
 - A Git repository for the target project.
+
+Install the Python dependencies (from this plugin's directory):
+
+```bash
+pip install -e .
+# or, to install just the runtime dependency:
+pip install "jsonschema>=4.18"
+```
+
+Run `controller.py doctor` to confirm all prerequisites (including
+`jsonschema`) are available before starting a workflow.
 
 Install Codex CLI when needed:
 

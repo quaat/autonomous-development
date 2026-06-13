@@ -9,12 +9,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from schema_validation import (  # noqa: E402
     SchemaValidationError,
+    _pointer,
     validate_payload,
 )
 
 REVIEW = "schemas/review.schema.json"
 REVIEW_DELTA = "schemas/review-delta.schema.json"
 ADVERSARIAL = "schemas/adversarial-review.schema.json"
+TRIAGE = "schemas/triage.schema.json"
 
 
 def _valid_review() -> dict:
@@ -151,6 +153,63 @@ class ValidatorNegativeTests(unittest.TestCase):
         msg = str(ctx.exception)
         self.assertIn("/confidence", msg)
         self.assertIn("/verdict", msg)
+
+
+class TriageSchemaTests(unittest.TestCase):
+    def test_valid_ledger_accepted(self) -> None:
+        validate_payload(
+            [
+                {"fingerprint": "a.py:f:bug", "status": "rejected", "reason": "r"},
+                {
+                    "fingerprint": "b.py:g:bug",
+                    "status": "resolved",
+                    "finding_id": "F-2",
+                    "resolution": "fixed",
+                },
+            ],
+            TRIAGE,
+        )
+
+    def test_missing_fingerprint_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError) as ctx:
+            validate_payload([{"status": "rejected", "reason": "r"}], TRIAGE)
+        self.assertIn("fingerprint", str(ctx.exception))
+
+    def test_empty_fingerprint_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError):
+            validate_payload([{"fingerprint": "", "status": "rejected"}], TRIAGE)
+
+    def test_unknown_status_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError) as ctx:
+            validate_payload(
+                [{"fingerprint": "a.py:f", "status": "looks-bad"}], TRIAGE
+            )
+        self.assertIn("/0/status", str(ctx.exception))
+
+    def test_non_array_rejected(self) -> None:
+        with self.assertRaises(SchemaValidationError):
+            validate_payload({"fingerprint": "x"}, TRIAGE)
+
+
+class JsonPointerEscapingTests(unittest.TestCase):
+    def test_root_pointer(self) -> None:
+        self.assertEqual(_pointer([]), "(root)")
+
+    def test_plain_tokens(self) -> None:
+        self.assertEqual(_pointer(["findings", 0, "severity"]), "/findings/0/severity")
+
+    def test_slash_is_escaped(self) -> None:
+        # RFC 6901: '/' in a token becomes '~1'.
+        self.assertEqual(_pointer(["a/b"]), "/a~1b")
+
+    def test_tilde_is_escaped(self) -> None:
+        # RFC 6901: '~' becomes '~0'.
+        self.assertEqual(_pointer(["a~b"]), "/a~0b")
+
+    def test_tilde_escaped_before_slash(self) -> None:
+        # '~1' must denote a literal '/', so an input '~1' must encode to '~01',
+        # not be confused with an escaped slash.
+        self.assertEqual(_pointer(["~1"]), "/~01")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -18,7 +19,11 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import argparse  # noqa: E402
 
 import controller  # noqa: E402
-from state import find_active_runs, resolve_repository  # noqa: E402
+from state import (  # noqa: E402
+    CrossProcessLock,
+    find_active_runs,
+    resolve_repository,
+)
 
 
 class ControllerTests(unittest.TestCase):
@@ -421,11 +426,29 @@ class ControllerTests(unittest.TestCase):
                 {
                     "title": "T",
                     "problem_statement": "P",
+                    "user_outcomes": ["o"],
                     "functional_requirements": [
-                        {"id": "FR-1", "requirement": "orig", "priority": "must"},
-                        {"id": "FR-2", "requirement": "drop", "priority": "should"},
+                        {
+                            "id": "FR-1",
+                            "requirement": "orig",
+                            "priority": "must",
+                            "evidence": "e",
+                        },
+                        {
+                            "id": "FR-2",
+                            "requirement": "drop",
+                            "priority": "should",
+                            "evidence": "e",
+                        },
                     ],
-                    "acceptance_criteria": [{"id": "AC-1", "criterion": "c"}],
+                    "non_functional_requirements": ["nfr"],
+                    "acceptance_criteria": [
+                        {"id": "AC-1", "criterion": "c", "verification": "v"}
+                    ],
+                    "assumptions": [],
+                    "open_questions": [],
+                    "risks": [],
+                    "non_goals": [],
                 }
             ),
             encoding="utf-8",
@@ -464,6 +487,52 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(accepted["functional_requirements"][0]["requirement"], "newtext")
         md = (run_dir / "accepted-spec.md").read_text(encoding="utf-8")
         self.assertIn("newtext", md)
+
+    def test_accept_rejects_incomplete_structured_source(self) -> None:
+        """The reconciliation source is fully validated against its phase schema
+        before materialization: an incomplete enhanced-idea (here missing the
+        required `evidence` on a functional requirement and several top-level
+        sections) must be rejected, and no accepted artifact may be written."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        run_dir = self._find_state_path(repo, state_home).parent
+
+        source = run_dir / "spec.codex.json"
+        source.write_text(
+            json.dumps(
+                {
+                    "title": "T",
+                    "problem_statement": "P",
+                    "functional_requirements": [
+                        {"id": "FR-1", "requirement": "x", "priority": "must"}
+                    ],
+                    "acceptance_criteria": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        decisions = run_dir / "spec-decisions.json"
+        decisions.write_text(
+            json.dumps({"accept": ["FR-1"], "reject": [], "modify": [], "add": []}),
+            encoding="utf-8",
+        )
+        result = self.run_controller(
+            repo, "accept", "--kind", "spec",
+            "--source", str(source), "--decisions", str(decisions),
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("schema validation", result.stderr)
+        self.assertFalse((run_dir / "accepted-spec.json").exists())
+        self.assertFalse((run_dir / "accepted-spec.md").exists())
+
+    def test_doctor_reports_jsonschema(self) -> None:
+        """`doctor` must surface jsonschema availability (a declared runtime
+        dependency required for every structural validation gate)."""
+        repo = self.make_repo()
+        result = self.run_controller(repo, "doctor")
+        self.assertIn("jsonschema", result.stdout)
 
     def test_next_action_progression(self) -> None:
         repo = self.make_repo()
@@ -1457,6 +1526,184 @@ class TerminalStateIntegrityTests(unittest.TestCase):
         )
         self.assertEqual(state["status"], "active")
         self.assertEqual(state["run_id"], run_id)
+
+    def test_unknown_status_rejects_every_mutation(self) -> None:
+        """An unrecognized status (corruption, partial write, or a status a
+        future build understands but this one does not) must fail closed for
+        every active-only mutation: 'not terminal' is not the same as 'active'.
+        The persisted state must be byte-identical afterwards."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_id = self._set_status(state_path, "some-unknown-status")
+        before = state_path.read_bytes()
+        for op, argv in self._mutation_commands():
+            with self.subTest(op=op):
+                result = self.run_controller(
+                    repo, "--run-id", run_id, *argv, state_home=state_home
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("requires an active run", result.stderr)
+                self.assertIn(run_id, result.stderr)
+                self.assertIn("some-unknown-status", result.stderr)
+                self.assertEqual(state_path.read_bytes(), before)
+
+    def test_missing_repository_id_rejects_mutation(self) -> None:
+        """An external-layout run whose state omits repository.id (not merely a
+        mismatched non-empty id) must be refused: an unbound run cannot be
+        mutated under an assumed repository identity."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        s = json.loads(state_path.read_text(encoding="utf-8"))
+        run_id = s["run_id"]
+        s["repository"]["id"] = ""
+        state_path.write_text(json.dumps(s), encoding="utf-8")
+        before = state_path.read_bytes()
+        result = self.run_controller(
+            repo, "--run-id", run_id, "set-phase", "--phase", "planning",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not record a repository id", result.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_cancellation_during_accept_keeps_artifacts_and_state(self) -> None:
+        """If the run is cancelled mid-accept (after artifacts are staged but
+        before they are published under the lock), the canonical artifact and
+        the run state must remain byte-identical and no staging files may be
+        left behind. Exercises the staged-then-atomic-publish path."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_dir = state_path.parent
+
+        # Pre-existing canonical accepted-spec.md whose bytes must not change.
+        canonical_md = run_dir / "accepted-spec.md"
+        canonical_md.write_text("ORIGINAL SPEC\n", encoding="utf-8")
+        md_before = canonical_md.read_bytes()
+
+        # The simulated external cancel writes this exact blob; the accept must
+        # add nothing further, so the final state must equal it byte-for-byte.
+        cancelled = json.loads(state_path.read_text(encoding="utf-8"))
+        cancelled["status"] = "cancelled"
+        cancelled["phase"] = "cancelled"
+        cancelled_bytes = json.dumps(cancelled).encode("utf-8")
+
+        new_spec = run_dir / "new-spec.md"
+        new_spec.write_text("REPLACEMENT SPEC\n", encoding="utf-8")
+
+        original_lock = controller.RunStateLock
+
+        class FlipLock(original_lock):  # type: ignore[valid-type,misc]
+            def __enter__(self_inner):  # noqa: N805
+                entered = super().__enter__()
+                state_path.write_bytes(cancelled_bytes)
+                return entered
+
+        controller.RunStateLock = FlipLock
+        try:
+            args = argparse.Namespace(
+                project_root=str(repo),
+                state_dir=str(state_home),
+                run_id=None,
+                kind="spec",
+                file=str(new_spec),
+                source=None,
+                decisions=None,
+            )
+            with self.assertRaises(controller.WorkflowError) as ctx:
+                controller.cmd_accept(args)
+        finally:
+            controller.RunStateLock = original_lock
+
+        self.assertIn("terminal", str(ctx.exception).lower())
+        # Canonical artifact untouched; staged temp files cleaned up.
+        self.assertEqual(canonical_md.read_bytes(), md_before)
+        self.assertEqual(
+            list(run_dir.glob(".accepted-spec.md.*.tmp")), []
+        )
+        # State equals exactly what the external cancel wrote — accept added nothing.
+        self.assertEqual(state_path.read_bytes(), cancelled_bytes)
+
+    def test_concurrent_generated_id_inits_make_one_active_run(self) -> None:
+        """Two concurrent `init` calls WITHOUT --run-id mint different generated
+        IDs, so a per-run lock cannot serialize them. The repository-level init
+        lock must still ensure exactly one active run is created; the loser
+        fails closed because no --force authorizes an additional run."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+
+        def spawn() -> subprocess.Popen[str]:
+            cmd = [
+                "python3", str(CONTROLLER),
+                "--project-root", str(repo),
+                "--state-dir", str(state_home),
+                "init", "--feature", "concurrent",
+            ]
+            return subprocess.Popen(
+                cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+        p1 = spawn()
+        p2 = spawn()
+        out1 = p1.communicate()
+        out2 = p2.communicate()
+        codes = sorted([p1.returncode, p2.returncode])
+        self.assertEqual(codes[0], 0, (out1, out2))
+        self.assertNotEqual(codes[1], 0, (out1, out2))
+        loser_err = out1[1] if p1.returncode != 0 else out2[1]
+        self.assertIn("already exist", loser_err)
+
+        repo_info = resolve_repository(repo)
+        runs = state_home / "repositories" / repo_info.id / "runs"
+        dirs = [d for d in runs.iterdir() if d.is_dir()]
+        self.assertEqual(len(dirs), 1, dirs)
+        actives = find_active_runs(state_home, repo_info.id)
+        self.assertEqual(len(actives), 1)
+
+    def test_concurrent_generated_id_inits_via_portable_lock(self) -> None:
+        """The same one-active-run invariant must hold on the Windows-compatible
+        portable lock backend (atomic O_CREAT|O_EXCL lock file), not only on the
+        POSIX fcntl path. Run in-process with the backend pinned so the portable
+        implementation's real mutual exclusion is exercised."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+
+        def do_init() -> None:
+            args = argparse.Namespace(
+                project_root=str(repo),
+                state_dir=str(state_home),
+                run_id=None,
+                feature="concurrent-portable",
+                label=None,
+                mode="lean",
+                max_review_rounds=3,
+                reuse=False,
+                force=False,
+            )
+            try:
+                controller.cmd_init(args)
+            except controller.WorkflowError:
+                pass  # the loser fails closed; that is the expected outcome
+
+        original_backend = CrossProcessLock.force_backend
+        CrossProcessLock.force_backend = "portable"
+        try:
+            threads = [threading.Thread(target=do_init) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            CrossProcessLock.force_backend = original_backend
+
+        repo_info = resolve_repository(repo)
+        runs = state_home / "repositories" / repo_info.id / "runs"
+        dirs = [d for d in runs.iterdir() if d.is_dir()]
+        self.assertEqual(len(dirs), 1, dirs)
+        actives = find_active_runs(state_home, repo_info.id)
+        self.assertEqual(len(actives), 1)
 
 
 if __name__ == "__main__":

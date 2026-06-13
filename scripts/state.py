@@ -10,6 +10,7 @@ import re
 import secrets
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -287,35 +288,158 @@ def atomic_write_json(path: Path, value: dict) -> None:
     temp.replace(path)
 
 
-class RunStateLock:
-    """Context manager for exclusive file lock on a run's lock file."""
+try:  # POSIX advisory locking
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - platform-dependent
+    _fcntl = None  # type: ignore[assignment]
 
-    def __init__(self, run_dir: Path) -> None:
-        self._lock_path = run_dir / ".run-state.lock"
+try:  # Windows mandatory locking
+    import msvcrt as _msvcrt
+except ImportError:  # pragma: no cover - platform-dependent
+    _msvcrt = None  # type: ignore[assignment]
+
+
+class LockTimeout(StateError):
+    """Raised when an exclusive lock cannot be acquired within the timeout."""
+
+
+class CrossProcessLock:
+    """Bounded, real cross-platform exclusive file lock.
+
+    Provides genuine mutual exclusion between independent processes (not a
+    best-effort no-op) so the run-state and repository-initialization critical
+    sections are safe on every supported platform. Backends, in priority order:
+
+      * ``fcntl``    — POSIX advisory ``flock`` (auto-released on close/crash).
+      * ``msvcrt``   — Windows mandatory byte-range lock (auto-released on
+                       close/crash).
+      * ``portable`` — atomic ``O_CREAT | O_EXCL`` lock-file. Works anywhere,
+                       including when neither ``fcntl`` nor ``msvcrt`` is
+                       available; this is the path a stripped-down or exotic
+                       platform falls back to.
+
+    The acquire is bounded by ``timeout`` seconds and raises ``LockTimeout``
+    with an actionable message rather than blocking forever. ``force_backend``
+    (class attribute) pins a backend so tests can exercise the portable /
+    Windows-compatible path on a POSIX host.
+    """
+
+    force_backend: str | None = None
+
+    def __init__(
+        self,
+        lock_path: Path,
+        *,
+        timeout: float = 30.0,
+        poll_interval: float = 0.02,
+    ) -> None:
+        self._lock_path = Path(lock_path)
+        self._timeout = timeout
+        self._poll = poll_interval
         self._fd: int | None = None
+        self._backend: str | None = None
+        self._holds_exclusive_file = False
 
-    def __enter__(self) -> RunStateLock:
-        run_dir = self._lock_path.parent
-        run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
-        try:
-            import fcntl
+    def _select_backend(self) -> str:
+        forced = type(self).force_backend
+        if forced:
+            return forced
+        if _fcntl is not None:
+            return "fcntl"
+        if _msvcrt is not None:
+            return "msvcrt"
+        return "portable"
 
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
-        except ImportError:
-            pass  # best-effort on platforms without fcntl
+    def _timeout_error(self) -> LockTimeout:
+        return LockTimeout(
+            f"Could not acquire lock {str(self._lock_path)!r} within "
+            f"{self._timeout:g}s. Another process may hold it; if no such "
+            "process exists the lock file can be removed manually."
+        )
+
+    def __enter__(self) -> CrossProcessLock:
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._backend = self._select_backend()
+        deadline = time.monotonic() + self._timeout
+        if self._backend == "portable":
+            self._acquire_portable(deadline)
+        else:
+            self._fd = os.open(str(self._lock_path), os.O_CREAT | os.O_WRONLY, 0o600)
+            self._acquire_fd(deadline)
         return self
+
+    def _acquire_fd(self, deadline: float) -> None:
+        assert self._fd is not None
+        while True:
+            try:
+                if self._backend == "fcntl":
+                    _fcntl.flock(self._fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                else:  # msvcrt
+                    _msvcrt.locking(self._fd, _msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise self._timeout_error()
+                time.sleep(self._poll)
+
+    def _acquire_portable(self, deadline: float) -> None:
+        while True:
+            try:
+                self._fd = os.open(
+                    str(self._lock_path),
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                self._holds_exclusive_file = True
+                return
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise self._timeout_error()
+                time.sleep(self._poll)
 
     def __exit__(self, *args: object) -> None:
         if self._fd is not None:
             try:
-                import fcntl
-
-                fcntl.flock(self._fd, fcntl.LOCK_UN)
-            except ImportError:
+                if self._backend == "fcntl":
+                    _fcntl.flock(self._fd, _fcntl.LOCK_UN)
+                elif self._backend == "msvcrt":
+                    try:
+                        _msvcrt.locking(self._fd, _msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+            finally:
+                os.close(self._fd)
+                self._fd = None
+        if self._holds_exclusive_file:
+            try:
+                self._lock_path.unlink()
+            except FileNotFoundError:
                 pass
-            os.close(self._fd)
-            self._fd = None
+            self._holds_exclusive_file = False
+
+
+class RunStateLock(CrossProcessLock):
+    """Exclusive lock guarding a single run's state file."""
+
+    def __init__(self, run_dir: Path, *, timeout: float = 30.0) -> None:
+        super().__init__(run_dir / ".run-state.lock", timeout=timeout)
+
+
+class RepoInitLock(CrossProcessLock):
+    """Repository-level lock serializing run creation for a repository.
+
+    Run-state locks are per-run-directory, so two concurrent ``init`` calls that
+    mint *different* run IDs never contend on a shared lock and could both pass
+    the "is another run already active?" check. This repository-scoped lock
+    makes the active-run check and run creation a single critical section.
+    """
+
+    def __init__(self, state_home: Path, repo_id: str, *, timeout: float = 30.0) -> None:
+        repo_dir = state_home / "repositories" / repo_id
+        repo_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        super().__init__(repo_dir / ".init.lock", timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -629,17 +753,38 @@ def _terminal_mutation_error(run_id: str, status: str, operation: str) -> StateE
     )
 
 
+def _inactive_mutation_error(run_id: str, status: str, operation: str) -> StateError:
+    return StateError(
+        f"Cannot {operation} run {run_id!r}: its status is {status!r}, but "
+        f"{operation} requires an active run. Inspect it with "
+        f"`status --run-id {run_id}`."
+    )
+
+
+def _reject_non_active(run_id: str, status: object, operation: str) -> None:
+    """Raise unless `status` is exactly the string "active".
+
+    Active-only mutations must require the canonical active status rather than
+    merely "not terminal": an unknown/garbage status (corruption, a future
+    status this build does not understand, or a partial write) must fail closed,
+    never be treated as mutable.
+    """
+    if status == "active":
+        return
+    if status in TERMINAL_STATUSES:
+        raise _terminal_mutation_error(run_id, str(status), operation)
+    raise _inactive_mutation_error(run_id, str(status), operation)
+
+
 def require_active_run_state(state: dict, run_id: str, operation: str) -> None:
-    """Raise if `state` is terminal. Call after reloading under the run lock.
+    """Raise unless `state` is exactly active. Call after reloading under the lock.
 
     This is the TOCTOU guard: a long-running operation (a verification check or a
     Codex exec) may have been cancelled/blocked while it ran, so the freshly
     reloaded status must be re-checked before publishing, or the write would
-    resurrect a terminal run.
+    resurrect a terminal (or otherwise non-active) run.
     """
-    status = state.get("status")
-    if status in TERMINAL_STATUSES:
-        raise _terminal_mutation_error(run_id, str(status), operation)
+    _reject_non_active(run_id, state.get("status"), operation)
 
 
 def verify_run_identity(ref: RunRef, repo_id: str) -> None:
@@ -662,7 +807,13 @@ def verify_run_identity(ref: RunRef, repo_id: str) -> None:
     recorded_repo_id = (
         recorded_repo.get("id") if isinstance(recorded_repo, dict) else None
     )
-    if recorded_repo_id and recorded_repo_id != repo_id:
+    if not recorded_repo_id:
+        raise StateError(
+            f"State integrity error: run {ref.run_dir.name!r} does not record a "
+            f"repository id; an external-layout run must be bound to its "
+            f"repository before it can be mutated."
+        )
+    if recorded_repo_id != repo_id:
         raise StateError(
             f"State integrity error: run {ref.run_dir.name!r} records repository "
             f"{recorded_repo_id!r} but the current repository is {repo_id!r}."
@@ -703,9 +854,7 @@ def resolve_run_for_active_mutation(
         state_home, repo_id, repo_root, run_id, allow_multiple=allow_multiple
     )
     verify_run_identity(ref, repo_id)
-    status = ref.state.get("status")
-    if status in TERMINAL_STATUSES:
-        raise _terminal_mutation_error(ref.run_id, str(status), operation)
+    _reject_non_active(ref.run_id, ref.state.get("status"), operation)
     return ref
 
 

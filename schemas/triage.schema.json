@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Triage ledger",
+  "description": "A list of finding dispositions applied to the cumulative review ledger. Every entry must carry a non-empty fingerprint (so a gate-affecting closure is auditable) and a recognized status. Validated in full before any disposition is applied.",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["fingerprint", "status"],
+    "properties": {
+      "fingerprint": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Semantic identity of the finding (file:symbol:issue)."
+      },
+      "status": {
+        "type": "string",
+        "enum": [
+          "accepted",
+          "resolved",
+          "rejected",
+          "rejected_with_evidence",
+          "already_resolved",
+          "out_of_scope_but_recorded",
+          "requires_human_decision",
+          "open"
+        ]
+      },
+      "finding_id": {
+        "type": "string",
+        "description": "Review id (F-N) of the cumulative finding this disposition releases or re-blocks."
+      },
+      "resolution": {"type": "string"},
+      "reason": {"type": "string"},
+      "evidence": {"type": "string"},
+      "justification": {"type": "string"}
+    }
+  }
+}
