@@ -14,10 +14,10 @@ ACCEPTED IMPLEMENTATION PLAN
 BASELINE COMMIT
 {{BASELINE}}
 
-RECORDED VERIFICATION
+RECORDED VERIFICATION (latest logical checks)
 {{VERIFICATION}}
 
-PREVIOUS REVIEW AND TRIAGE
+FINDING LEDGER (fingerprints from prior triage; rejected entries must not be re-raised)
 {{PREVIOUS_REVIEW}}
 
 Rules:

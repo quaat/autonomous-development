@@ -32,6 +32,7 @@ from state import (  # noqa: E402
     resolve_repository,
     resolve_state_home,
     resolve_active_run,
+    resolve_run_for_inspection,
     run_dir_path,
     save_run_state,
     validate_state,
@@ -346,6 +347,30 @@ class StateModuleTests(unittest.TestCase):
         self.assertIn(run_id_a, err_msg)
         self.assertIn(run_id_b, err_msg)
 
+    def test_inspection_resolves_newest_by_created_at_not_run_id(self) -> None:
+        """With no active run, read-only inspection must select the run with the
+        newest created_at, not the lexically-largest run_id (legacy/custom ids
+        need not be chronological)."""
+        repo = self.make_repo_with_config()
+        state_home = self._tmpdir()
+        repo_info = resolve_repository(repo)
+
+        # The lexically-LARGER id ("zzz-old") is the OLDER run; the lexically-
+        # smaller id ("aaa-new") is the NEWER run by created_at.
+        older = _minimal_state(run_id="zzz-old", status="complete")
+        older["created_at"] = "2026-01-01T00:00:00Z"
+        newer = _minimal_state(run_id="aaa-new", status="complete")
+        newer["created_at"] = "2026-06-01T00:00:00Z"
+        for st in (older, newer):
+            rdir = run_dir_path(state_home, repo_info.id, st["run_id"])
+            rdir.mkdir(parents=True, exist_ok=True)
+            save_run_state(rdir, st)
+
+        ref = resolve_run_for_inspection(
+            state_home, repo_info.id, repo.resolve(), run_id=None
+        )
+        self.assertEqual(ref.run_id, "aaa-new")
+
     # -----------------------------------------------------------------------
     # 11. relative artifact resolution after state move
     # -----------------------------------------------------------------------
@@ -372,6 +397,28 @@ class StateModuleTests(unittest.TestCase):
 
         self.assertEqual(resolved, (new_run_dir / "output.txt").resolve())
         self.assertTrue(resolved.exists())
+
+    def test_artifact_path_rejects_absolute_outside_run_dir(self) -> None:
+        """An absolute artifact pointer outside the run dir must be rejected so a
+        crafted/legacy run-state cannot exfiltrate arbitrary local files."""
+        state_home = self._tmpdir()
+        run_dir = run_dir_path(state_home, "fakerepo0000002", "test-run-0002")
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        secret = self._tmpdir() / "secret.txt"
+        secret.write_text("top secret", encoding="utf-8")
+
+        with self.assertRaises(StateError):
+            resolve_artifact_path(str(secret), run_dir)
+        with self.assertRaises(StateError):
+            resolve_artifact_path("../../../../etc/passwd", run_dir)
+
+        # An absolute path that genuinely lives inside the run dir still resolves.
+        inside = run_dir / "output.txt"
+        inside.write_text("ok", encoding="utf-8")
+        self.assertEqual(
+            resolve_artifact_path(str(inside), run_dir), inside.resolve()
+        )
 
     # -----------------------------------------------------------------------
     # 12. branch drift detection

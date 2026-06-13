@@ -14,10 +14,10 @@ ACCEPTED PLAN
 BASELINE
 {{BASELINE}}
 
-LATEST CODE REVIEW
+FINDING LEDGER (fingerprints from prior triage)
 {{LATEST_REVIEW}}
 
-RECORDED VERIFICATION
+RECORDED VERIFICATION (latest logical checks)
 {{VERIFICATION}}
 
 Inspect the actual repository changes. Specifically test the design mentally against:

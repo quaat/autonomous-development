@@ -20,3 +20,23 @@ For a high-risk feature:
 ```text
 /autonomous-development:adversarial-review "The change modifies authorization and persistent access-token storage"
 ```
+
+## Controller modes and reporting
+
+`auto` mode (the default) scales the workflow to the change and escalates conservatively:
+
+```bash
+# Low-risk, localized work runs lean/standard; high-risk work escalates to rigorous.
+controller.py init --feature "Rename a button label" --mode auto
+
+# Force the full workflow with mandatory adversarial review.
+controller.py init --feature "Add tenant-scoped billing" --mode rigorous
+```
+
+Drive phases and inspect token usage:
+
+```bash
+controller.py next-action --json
+controller.py run-check --name unit-tests --output summary -- pytest -q
+controller.py usage-report
+```

@@ -80,6 +80,75 @@ make check
 claude plugin validate . --strict
 ```
 
+## Adaptive workflow modes
+
+`init` accepts `--mode` to scale workflow depth to the change:
+
+```bash
+# auto (default): inspect the feature and escalate conservatively
+controller.py init --feature "Add Stripe billing" --mode auto
+
+# lean: clear, low-risk, localized work
+# standard: normal feature work (skips independent idea enhancement)
+# rigorous: full workflow with mandatory adversarial review
+controller.py init --feature "Rename a button label" --mode standard
+```
+
+`auto` escalates to `rigorous` when it classifies the feature as touching auth/authz,
+persistence/migrations, regulated data, billing, concurrency, public API compatibility, broad
+architecture, or destructive behavior. It never downgrades an explicitly requested mode, and an
+explicit `rigorous` (or escalated `auto`) run requires an adversarial review to complete.
+
+The main skill is a state-machine driver: it repeatedly asks the controller for the next phase
+and executes it.
+
+```bash
+controller.py next-action --json
+# -> { "phase": "verification", "required_action": "...",
+#      "completion_condition": "...", "references": [...] }
+```
+
+## Token efficiency
+
+The controller minimizes the context that flows back into the model:
+
+```bash
+# Summary output (default): one line plus the on-disk log path
+controller.py run-check --name unit-tests --output summary -- pytest -q
+# ✓ unit-tests passed in 18.4 s
+#   command: pytest -q
+#   full log: .../verification/03-unit-tests.log
+
+# Failures show a bounded tail; --output full replays complete streams
+controller.py run-check --name unit-tests --failure-tail-lines 80 -- pytest -q
+```
+
+Codex phases run with `codex exec --json`, retain the NDJSON event stream, and record per-phase
+usage. Inspect it with:
+
+```bash
+controller.py usage-report
+# Phase             Prompt chars   Output chars    Duration
+# enhance                 14,220          5,810        67 s
+# plan                    23,840          9,120       104 s
+# review-01               31,440          6,330       119 s
+```
+
+Reconciliation uses deltas rather than rewriting whole artifacts. Claude writes a decision file
+(`accept`/`reject`/`modify`/`add`) and the controller materializes the accepted artifact:
+
+```bash
+controller.py accept --kind spec \
+  --source feature-spec.codex.json \
+  --decisions spec-reconciliation.json
+```
+
+Review triage is recorded as a finding ledger so later rounds never re-raise rejected findings:
+
+```bash
+controller.py triage --file triage-01.json
+```
+
 ## State location
 
 State is stored outside the target repository by default. The resolver uses the following
@@ -248,6 +317,8 @@ Run autonomous development in a disposable branch or worktree. The orchestrator 
 - Edit `schemas/*.schema.json` to add organization-specific output requirements.
 - Extend `skills/verify-feature/references/check-discovery.md` with project-specific commands.
 - Change `max_review_rounds` through the controller's `init --max-review-rounds` option.
+- Map workflow phases to locally available Codex models and reasoning settings with
+  `CLAUDE_AUTONOMOUS_PHASE_PROFILES` (JSON) and `CLAUDE_AUTONOMOUS_CODEX_MODEL_<PHASE>`.
 
 ## Compatibility note
 

@@ -31,6 +31,36 @@ class ProjectLayoutTests(unittest.TestCase):
         for path in ROOT.rglob("*.json"):
             json.loads(path.read_text(encoding="utf-8"))
 
+    def test_output_schemas_are_strict_required(self) -> None:
+        """Codex --output-schema objects must list every property in `required`
+        (OpenAI strict structured outputs reject any omission)."""
+
+        def violations(node: object, path: str) -> list[tuple[str, list[str]]]:
+            found: list[tuple[str, list[str]]] = []
+            if isinstance(node, dict):
+                props = node.get("properties")
+                if node.get("type") == "object" and isinstance(props, dict):
+                    missing = sorted(set(props) - set(node.get("required", [])))
+                    if missing:
+                        found.append((path, missing))
+                for key, value in node.items():
+                    found += violations(value, f"{path}/{key}")
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    found += violations(value, f"{path}[{index}]")
+            return found
+
+        for name in (
+            "enhanced-idea",
+            "implementation-plan",
+            "review",
+            "review-delta",
+            "adversarial-review",
+        ):
+            path = ROOT / "schemas" / f"{name}.schema.json"
+            schema = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(violations(schema, "(root)"), [], f"{name}: {path}")
+
     def test_prompt_placeholders_are_known(self) -> None:
         known = {
             "FEATURE",
@@ -42,6 +72,8 @@ class ProjectLayoutTests(unittest.TestCase):
             "VERIFICATION",
             "PREVIOUS_REVIEW",
             "LATEST_REVIEW",
+            "FINDING_LEDGER",
+            "OPEN_FINDINGS",
         }
         import re
 

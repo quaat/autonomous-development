@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reconciliation decision delta",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "accept": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "reject": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "reason"],
+        "properties": {
+          "id": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    },
+    "modify": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "replacement"],
+        "properties": {
+          "id": {"type": "string"},
+          "replacement": {"type": "string"}
+        }
+      }
+    },
+    "add": {
+      "type": "array",
+      "items": {"type": "object"}
+    }
+  }
+}

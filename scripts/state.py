@@ -216,13 +216,18 @@ def make_relative_path(absolute: Path, run_dir: Path) -> str:
 
 
 def resolve_artifact_path(relative_or_abs: str, run_dir: Path) -> Path:
-    """Resolve relative to absolute. Reject '..' traversal outside run_dir."""
+    """Resolve an artifact pointer to an absolute path confined to run_dir.
+
+    Artifact pointers are controller-generated and always live inside the run
+    directory. Reject both absolute paths and `..` traversal that escape run_dir
+    so a crafted or legacy run-state cannot aim an artifact at an arbitrary local
+    file and exfiltrate its contents into a Codex prompt.
+    """
     p = Path(relative_or_abs)
-    if p.is_absolute():
-        return p
-    resolved = (run_dir / p).resolve()
+    base = run_dir.resolve()
+    resolved = p.resolve() if p.is_absolute() else (run_dir / p).resolve()
     try:
-        resolved.relative_to(run_dir.resolve())
+        resolved.relative_to(base)
     except ValueError:
         raise StateError(f"Artifact path escapes run directory: {relative_or_abs!r}")
     return resolved
@@ -545,6 +550,49 @@ def resolve_active_run(
     )
 
 
+def resolve_run_for_inspection(
+    state_home: Path,
+    repo_id: str,
+    repo_root: Path,
+    run_id: str | None = None,
+) -> RunRef:
+    """Resolve a run for READ-ONLY inspection (status, usage-report).
+
+    Like `resolve_active_run`, but when no active run exists it falls back to
+    the most-recently-created run (terminal ones included) so inspection keeps
+    working after a run completes/cancels. Mutating commands must keep using
+    `resolve_active_run`, which intentionally refuses to operate on terminal runs
+    without an explicit `--run-id`.
+    """
+    if run_id is not None:
+        return resolve_active_run(state_home, repo_id, repo_root, run_id)
+
+    active = find_active_runs(state_home, repo_id)
+    if len(active) == 1:
+        return active[0]
+    if len(active) > 1:
+        ids = ", ".join(r.run_id for r in active)
+        raise StateError(
+            f"Multiple active runs found: {ids}. "
+            "Specify one with --run-id <run_id> or use `list-runs` to review them."
+        )
+
+    all_runs = find_all_runs(state_home, repo_id)
+    if all_runs:
+        # Order by the recorded creation timestamp (ISO-8601, sortable), not the
+        # run_id: a legacy/custom id need not be chronological, so lexical id
+        # ordering could pick a stale run. Fall back to run_id when created_at is
+        # absent so ordering is still deterministic.
+        return max(
+            all_runs,
+            key=lambda r: (str(r.state.get("created_at") or ""), r.run_id),
+        )
+
+    # No runs at all: defer to resolve_active_run for the canonical legacy
+    # detection / "no run found" guidance.
+    return resolve_active_run(state_home, repo_id, repo_root, None)
+
+
 # ---------------------------------------------------------------------------
 # Drift detection
 # ---------------------------------------------------------------------------
@@ -639,17 +687,112 @@ def detect_drift(state: dict, repo: RepoInfo) -> DriftResult:
 # ---------------------------------------------------------------------------
 
 
+_INSTRUCTION_NAMES = frozenset({"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".cursorrules"})
+_BUILD_MANIFEST_NAMES = frozenset(
+    {
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+        "Pipfile",
+        "package.json",
+        "pnpm-workspace.yaml",
+        "Cargo.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "Gemfile",
+        "composer.json",
+        "Makefile",
+        "CMakeLists.txt",
+    }
+)
+_TEST_DIR_NAMES = frozenset({"tests", "test", "__tests__", "spec"})
+_CI_PREFIXES = (".github/workflows/", ".gitlab-ci", ".circleci/", "azure-pipelines")
+
+
+def build_repository_manifest(tracked_files: list[str]) -> dict[str, list[str]]:
+    """Derive a compact, relevance-oriented manifest from the tracked file set.
+
+    Returns sections (instructions, build manifests, primary modules, test roots,
+    CI workflows) instead of an arbitrary file dump. Pure function of the file list
+    so it is deterministically testable.
+    """
+    instructions: list[str] = []
+    build_manifests: list[str] = []
+    test_roots: set[str] = set()
+    ci: list[str] = []
+    top_dirs: set[str] = set()
+
+    for raw in tracked_files:
+        path = raw.strip()
+        if not path:
+            continue
+        parts = path.split("/")
+        name = parts[-1]
+
+        if name in _INSTRUCTION_NAMES:
+            instructions.append(path)
+        if name in _BUILD_MANIFEST_NAMES:
+            build_manifests.append(path)
+        if path.startswith(_CI_PREFIXES) or name in {
+            ".gitlab-ci.yml",
+            "azure-pipelines.yml",
+        }:
+            ci.append(path)
+
+        for depth, segment in enumerate(parts[:-1]):
+            if segment in _TEST_DIR_NAMES:
+                test_roots.add("/".join(parts[: depth + 1]))
+                break
+
+        if len(parts) > 1 and not parts[0].startswith("."):
+            top_dirs.add(parts[0])
+
+    primary_modules = sorted(d for d in top_dirs if d not in _TEST_DIR_NAMES)
+    return {
+        "instructions": sorted(set(instructions)),
+        "build_manifests": sorted(set(build_manifests)),
+        "primary_modules": primary_modules,
+        "test_roots": sorted(test_roots),
+        "ci": sorted(set(ci)),
+    }
+
+
+def _format_manifest_section(title: str, items: list[str]) -> str:
+    if not items:
+        return f"{title}:\n- (none)\n"
+    body = "\n".join(f"- {item}" for item in items)
+    return f"{title}:\n{body}\n"
+
+
 def repository_context(repo: RepoInfo) -> str:
-    """Return a human-readable summary of the repository for inclusion in Codex prompts."""
+    """Return a compact repository manifest for inclusion in Codex prompts.
+
+    Replaces the former first-250-tracked-files dump with relevance-oriented
+    sections so Codex learns where conventions and build boundaries live.
+    """
     tracked = _run_git("ls-files", cwd=repo.canonical_root)
-    top_files = "\n".join(tracked.splitlines()[:250])
+    manifest = build_repository_manifest(tracked.splitlines())
     status = _run_git("status", "--short", cwd=repo.canonical_root)
-    remotes = _run_git("remote", "-v", cwd=repo.canonical_root)
+    sections = (
+        _format_manifest_section("Instructions", manifest["instructions"])
+        + "\n"
+        + _format_manifest_section("Build manifests", manifest["build_manifests"])
+        + "\n"
+        + _format_manifest_section("Primary modules", manifest["primary_modules"])
+        + "\n"
+        + _format_manifest_section("Test roots", manifest["test_roots"])
+        + "\n"
+        + _format_manifest_section("CI", manifest["ci"])
+    )
     return (
         f"Repository: {repo.display_name}\n"
         f'Branch: {repo.branch or "(detached)"}\n'
         f'HEAD: {repo.head_commit or "(unknown)"}\n'
         f'Working tree status:\n{status or "(clean)"}\n\n'
-        f'Remotes (informational only; workflow must not push):\n{remotes or "(none)"}\n\n'
-        f'First tracked files (maximum 250):\n{top_files or "(none)"}\n'
+        f'Remote (credential-stripped, informational; workflow must not push): '
+        f'{repo.remote_display or "(none)"}\n\n'
+        f"{sections}"
     )
