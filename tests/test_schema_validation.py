@@ -190,6 +190,31 @@ class TriageSchemaTests(unittest.TestCase):
         with self.assertRaises(SchemaValidationError):
             validate_payload({"fingerprint": "x"}, TRIAGE)
 
+    def test_canonical_finding_id_accepted(self) -> None:
+        validate_payload(
+            [{"fingerprint": "a.py:f", "status": "resolved", "finding_id": "F-10"}],
+            TRIAGE,
+        )
+
+    def test_malformed_finding_id_rejected(self) -> None:
+        # A non-canonical finding_id is silently dropped by the merge, so the
+        # schema must reject it instead of letting the command misreport it as
+        # recorded.
+        for bad in ("bug-7", "F7", "f-7", "F-", "F-1a"):
+            with self.subTest(finding_id=bad):
+                with self.assertRaises(SchemaValidationError) as ctx:
+                    validate_payload(
+                        [
+                            {
+                                "fingerprint": "a.py:f",
+                                "status": "resolved",
+                                "finding_id": bad,
+                            }
+                        ],
+                        TRIAGE,
+                    )
+                self.assertIn("/0/finding_id", str(ctx.exception))
+
 
 class JsonPointerEscapingTests(unittest.TestCase):
     def test_root_pointer(self) -> None:

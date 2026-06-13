@@ -15,6 +15,7 @@ from state import (
     StateError,
     find_active_runs,
     load_run_state,
+    require_active_run_state,
     resolve_repository,
     resolve_state_home,
     save_run_state,
@@ -76,7 +77,14 @@ def _block_and_exit(run_dir: Path) -> int:
             state = load_run_state(run_dir, required=True)
         except Exception:
             return 0
-        if state.get("status") in TERMINAL_STATUSES:
+        # Require exactly "active" before mutating anything. An unknown, missing,
+        # or non-string status (corruption, a partial write, or a status a future
+        # build understands but this one does not) is NOT merely "not terminal";
+        # the automatic Stop hook must fail safe and leave such state untouched
+        # rather than incrementing the counter or flipping it to "blocked".
+        try:
+            require_active_run_state(state, str(state.get("run_id", "")), "block")
+        except StateError:
             return 0
         blocks = int(state.get("stop_gate_blocks", 0))
         if blocks >= MAX_GATE_BLOCKS:

@@ -210,6 +210,52 @@ class ControllerTests(unittest.TestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "blocked")
 
+    def test_stop_gate_leaves_non_active_status_byte_identical(self) -> None:
+        """The automatic Stop hook must mutate only an exactly-active run. A
+        status that is unknown, missing, or non-string is NOT merely
+        'not terminal'; the hook must fail safe and leave such state
+        byte-identical, neither incrementing the counter nor blocking."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.assertEqual(
+            self.run_controller(
+                repo, "init", "--feature", "Feature", state_home=state_home
+            ).returncode,
+            0,
+        )
+        state_path = self._find_state_path(repo, state_home)
+        payload = json.dumps({"cwd": str(repo), "hook_event_name": "Stop"})
+        env = {**os.environ, "CLAUDE_AUTONOMOUS_STATE_HOME": str(state_home)}
+
+        missing = object()
+        cases = [
+            ("unknown", "some-unknown-status"),
+            ("missing", missing),
+            ("non-string", 123),
+        ]
+        for label, status in cases:
+            with self.subTest(case=label):
+                s = json.loads(state_path.read_text(encoding="utf-8"))
+                if status is missing:
+                    s.pop("status", None)
+                else:
+                    s["status"] = status
+                state_path.write_text(json.dumps(s), encoding="utf-8")
+                before = state_path.read_bytes()
+                result = subprocess.run(
+                    ["python3", str(STOP_GATE)],
+                    input=payload,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                # No block decision was emitted.
+                self.assertEqual(result.stdout, "")
+                # The run-state file is untouched.
+                self.assertEqual(state_path.read_bytes(), before)
+
     def test_reuse_ambiguous_multiple_runs_errors(self) -> None:
         """init --reuse with multiple active runs must error rather than silently pick one."""
         repo = self.make_repo()
@@ -526,6 +572,208 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("schema validation", result.stderr)
         self.assertFalse((run_dir / "accepted-spec.json").exists())
         self.assertFalse((run_dir / "accepted-spec.md").exists())
+
+    # --- rollback-safe accept publication (failure injection) ---
+
+    def _structured_accept_args(
+        self, repo: Path, state_home: Path, run_dir: Path
+    ) -> argparse.Namespace:
+        """Stage a valid two-artifact (Markdown + JSON) structured spec accept so
+        the publish loop performs two backup+publish replace pairs."""
+        source = run_dir / "spec.codex.json"
+        source.write_text(
+            json.dumps(
+                {
+                    "title": "T",
+                    "problem_statement": "P",
+                    "user_outcomes": ["o"],
+                    "functional_requirements": [
+                        {
+                            "id": "FR-1",
+                            "requirement": "orig",
+                            "priority": "must",
+                            "evidence": "e",
+                        }
+                    ],
+                    "non_functional_requirements": ["nfr"],
+                    "acceptance_criteria": [
+                        {"id": "AC-1", "criterion": "c", "verification": "v"}
+                    ],
+                    "assumptions": [],
+                    "open_questions": [],
+                    "risks": [],
+                    "non_goals": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        decisions = run_dir / "spec-decisions.json"
+        decisions.write_text(
+            json.dumps({"accept": ["FR-1"], "reject": [], "modify": [], "add": []}),
+            encoding="utf-8",
+        )
+        return argparse.Namespace(
+            project_root=str(repo),
+            state_dir=str(state_home),
+            run_id=None,
+            kind="spec",
+            file=None,
+            source=str(source),
+            decisions=str(decisions),
+        )
+
+    def _failing_replace(self, fail_on_call: int):
+        """Return an os.replace wrapper that raises on the Nth invocation.
+
+        Within cmd_accept, os.replace is used only by the publish loop (backup
+        and publish moves), so the call index deterministically targets a
+        specific point in the all-or-nothing publication.
+        """
+        real = controller.os.replace
+        counter = {"n": 0}
+
+        def fake(src, dst, *a, **k):
+            counter["n"] += 1
+            if counter["n"] == fail_on_call:
+                raise OSError("injected os.replace failure")
+            return real(src, dst, *a, **k)
+
+        return fake
+
+    def _assert_no_temp_or_backup_artifacts(self, run_dir: Path) -> None:
+        leftovers = list(run_dir.glob(".accepted-spec.*"))
+        self.assertEqual(leftovers, [], leftovers)
+
+    def test_accept_rollback_when_first_replace_fails(self) -> None:
+        """If the very first publish replace fails, no canonical artifact may
+        change and the run state must be untouched (save never reached)."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        canonical_md = run_dir / "accepted-spec.md"
+        canonical_json = run_dir / "accepted-spec.json"
+        canonical_md.write_text("ORIGINAL MD\n", encoding="utf-8")
+        canonical_json.write_text('{"original": true}\n', encoding="utf-8")
+        md_before = canonical_md.read_bytes()
+        json_before = canonical_json.read_bytes()
+        state_before = state_path.read_bytes()
+
+        args = self._structured_accept_args(repo, state_home, run_dir)
+        original = controller.os.replace
+        controller.os.replace = self._failing_replace(1)
+        try:
+            with self.assertRaises(OSError):
+                controller.cmd_accept(args)
+        finally:
+            controller.os.replace = original
+
+        self.assertEqual(canonical_md.read_bytes(), md_before)
+        self.assertEqual(canonical_json.read_bytes(), json_before)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self._assert_no_temp_or_backup_artifacts(run_dir)
+
+    def test_accept_rollback_when_second_artifact_replace_fails(self) -> None:
+        """The first artifact is fully published, then the second artifact's
+        publish replace fails. Both canonical artifacts must be restored to
+        their pre-accept bytes and the run state left unchanged."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        canonical_md = run_dir / "accepted-spec.md"
+        canonical_json = run_dir / "accepted-spec.json"
+        canonical_md.write_text("ORIGINAL MD\n", encoding="utf-8")
+        canonical_json.write_text('{"original": true}\n', encoding="utf-8")
+        md_before = canonical_md.read_bytes()
+        json_before = canonical_json.read_bytes()
+        state_before = state_path.read_bytes()
+
+        args = self._structured_accept_args(repo, state_home, run_dir)
+        # Calls: 1=backup md, 2=publish md, 3=backup json, 4=publish json.
+        original = controller.os.replace
+        controller.os.replace = self._failing_replace(4)
+        try:
+            with self.assertRaises(OSError):
+                controller.cmd_accept(args)
+        finally:
+            controller.os.replace = original
+
+        self.assertEqual(canonical_md.read_bytes(), md_before)
+        self.assertEqual(canonical_json.read_bytes(), json_before)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self._assert_no_temp_or_backup_artifacts(run_dir)
+
+    def test_accept_rollback_when_state_save_fails_with_both_prior(self) -> None:
+        """Both artifacts are published, then save_run_state fails. Because the
+        state file is written atomically (the prior state survives a failed
+        save), restoring both canonical artifacts from backup restores full
+        artifact/state consistency."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        canonical_md = run_dir / "accepted-spec.md"
+        canonical_json = run_dir / "accepted-spec.json"
+        canonical_md.write_text("ORIGINAL MD\n", encoding="utf-8")
+        canonical_json.write_text('{"original": true}\n', encoding="utf-8")
+        md_before = canonical_md.read_bytes()
+        json_before = canonical_json.read_bytes()
+        state_before = state_path.read_bytes()
+
+        args = self._structured_accept_args(repo, state_home, run_dir)
+        original_save = controller.save_run_state
+
+        def failing_save(*a, **k):
+            raise OSError("injected save_run_state failure")
+
+        controller.save_run_state = failing_save
+        try:
+            with self.assertRaises(OSError):
+                controller.cmd_accept(args)
+        finally:
+            controller.save_run_state = original_save
+
+        self.assertEqual(canonical_md.read_bytes(), md_before)
+        self.assertEqual(canonical_json.read_bytes(), json_before)
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self._assert_no_temp_or_backup_artifacts(run_dir)
+
+    def test_accept_rollback_removes_artifacts_when_no_prior_canonical(self) -> None:
+        """When no canonical artifact existed before the accept, a failed
+        publication must remove the just-published artifacts entirely (there is
+        no prior file to restore) and leave the run state unchanged."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        canonical_md = run_dir / "accepted-spec.md"
+        canonical_json = run_dir / "accepted-spec.json"
+        self.assertFalse(canonical_md.exists())
+        self.assertFalse(canonical_json.exists())
+        state_before = state_path.read_bytes()
+
+        args = self._structured_accept_args(repo, state_home, run_dir)
+        original_save = controller.save_run_state
+
+        def failing_save(*a, **k):
+            raise OSError("injected save_run_state failure")
+
+        controller.save_run_state = failing_save
+        try:
+            with self.assertRaises(OSError):
+                controller.cmd_accept(args)
+        finally:
+            controller.save_run_state = original_save
+
+        self.assertFalse(canonical_md.exists())
+        self.assertFalse(canonical_json.exists())
+        self.assertEqual(state_path.read_bytes(), state_before)
+        self._assert_no_temp_or_backup_artifacts(run_dir)
 
     def test_doctor_reports_jsonschema(self) -> None:
         """`doctor` must surface jsonschema availability (a declared runtime
@@ -1704,6 +1952,122 @@ class TerminalStateIntegrityTests(unittest.TestCase):
         self.assertEqual(len(dirs), 1, dirs)
         actives = find_active_runs(state_home, repo_info.id)
         self.assertEqual(len(actives), 1)
+
+    def test_concurrent_force_inits_keep_metadata_consistent(self) -> None:
+        """Two concurrent `init --force` processes (each authorized to add an
+        independent run) must both succeed, leave the shared metadata.json as
+        valid JSON, create intact active run states, and leave no staging temp
+        files. Exercises metadata publication serialized inside RepoInitLock and
+        the invocation-unique temp file in atomic_write_json."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+
+        def spawn() -> subprocess.Popen[str]:
+            cmd = [
+                "python3", str(CONTROLLER),
+                "--project-root", str(repo),
+                "--state-dir", str(state_home),
+                "init", "--feature", "concurrent-force", "--force",
+            ]
+            return subprocess.Popen(
+                cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+        p1 = spawn()
+        p2 = spawn()
+        out1 = p1.communicate()
+        out2 = p2.communicate()
+        # Both are authorized (the first finds no active run; the second finds
+        # one but --force permits an additional independent run), so both win.
+        self.assertEqual(p1.returncode, 0, out1)
+        self.assertEqual(p2.returncode, 0, out2)
+
+        repo_info = resolve_repository(repo)
+        repo_dir = state_home / "repositories" / repo_info.id
+
+        # metadata.json is intact, valid JSON.
+        meta = json.loads((repo_dir / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["id"], repo_info.id)
+        self.assertIn("last_run_id", meta)
+
+        # No staging temp file from the unique-temp atomic write was left behind.
+        leftovers = list(repo_dir.rglob("*.tmp"))
+        self.assertEqual(leftovers, [], leftovers)
+
+        # Exactly two intact, active runs exist; each state file parses.
+        dirs = [d for d in (repo_dir / "runs").iterdir() if d.is_dir()]
+        self.assertEqual(len(dirs), 2, dirs)
+        for d in dirs:
+            s = json.loads((d / "run-state.json").read_text(encoding="utf-8"))
+            self.assertEqual(s["status"], "active")
+        self.assertEqual(len(find_active_runs(state_home, repo_info.id)), 2)
+
+    # --- lifecycle-transition identity invariants (cancel/block/archive-run) ---
+
+    # cancel/block require an active source; archive-run requires a terminal one.
+    # Identity is validated before the transition table, so each command is set
+    # up in its own valid source status to prove that identity — not the
+    # transition policy — is what refuses the tampered run.
+    _TRANSITIONS = (
+        ("cancel", ["cancel"], "active"),
+        ("block", ["block", "--reason", "x"], "active"),
+        ("archive-run", ["archive-run"], "complete"),
+    )
+
+    def test_lifecycle_transitions_reject_run_id_directory_mismatch(self) -> None:
+        """cancel/block/archive-run mutate state, so they must enforce the same
+        run-identity invariants as active mutations. A state whose run_id does
+        not match its run directory name must be refused before any transition,
+        leaving the persisted bytes unchanged."""
+        for op, argv, status in self._TRANSITIONS:
+            with self.subTest(op=op):
+                repo = self.make_repo()
+                state_home = self.make_state_home()
+                state_path = self.init_run(repo, state_home)
+                s = json.loads(state_path.read_text(encoding="utf-8"))
+                dir_name = state_path.parent.name
+                s["status"] = status
+                s["phase"] = status
+                s["run_id"] = "tampered-does-not-match-dir"
+                state_path.write_text(json.dumps(s), encoding="utf-8")
+                before = state_path.read_bytes()
+                result = self.run_controller(
+                    repo, "--run-id", dir_name, *argv, state_home=state_home
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(
+                    "does not match its run directory name", result.stderr
+                )
+                self.assertEqual(state_path.read_bytes(), before)
+
+    def test_lifecycle_transitions_reject_repository_id_violations(self) -> None:
+        """A lifecycle transition on an external-layout run whose repository.id
+        is missing (unbound) or mismatched (belongs to another repository) must
+        fail closed before any transition, leaving the persisted bytes
+        unchanged."""
+        cases = (
+            ("", "does not record a repository id"),
+            ("some-other-repo-id", "records repository"),
+        )
+        for op, argv, status in self._TRANSITIONS:
+            for repo_id, expected in cases:
+                with self.subTest(op=op, repo_id=repo_id):
+                    repo = self.make_repo()
+                    state_home = self.make_state_home()
+                    state_path = self.init_run(repo, state_home)
+                    s = json.loads(state_path.read_text(encoding="utf-8"))
+                    run_id = s["run_id"]
+                    s["status"] = status
+                    s["phase"] = status
+                    s["repository"]["id"] = repo_id
+                    state_path.write_text(json.dumps(s), encoding="utf-8")
+                    before = state_path.read_bytes()
+                    result = self.run_controller(
+                        repo, "--run-id", run_id, *argv, state_home=state_home
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn(expected, result.stderr)
+                    self.assertEqual(state_path.read_bytes(), before)
 
 
 if __name__ == "__main__":

@@ -20,7 +20,9 @@ STOP_GATE = SCRIPTS / "stop_gate.py"
 sys.path.insert(0, str(SCRIPTS))
 import state as state_module  # noqa: E402
 from state import (  # noqa: E402
+    CrossProcessLock,
     DriftKind,
+    LockTimeout,
     RunStateLock,
     StateError,
     detect_drift,
@@ -602,6 +604,55 @@ class StateModuleTests(unittest.TestCase):
             NUM_THREADS * NUM_INCREMENTS,
             "Lost updates detected in concurrent mutation",
         )
+
+    def test_portable_lock_timeout_guidance_is_recoverable(self) -> None:
+        """The portable (O_EXCL marker file) backend may strand a lock if a
+        holder crashes, so its timeout message must attribute the recorded owner
+        and tell the operator to remove the file once that process is gone."""
+        lock_dir = self._tmpdir()
+        lock_path = lock_dir / ".x.lock"
+        original = CrossProcessLock.force_backend
+        CrossProcessLock.force_backend = "portable"
+        held = CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01)
+        try:
+            held.__enter__()
+            with self.assertRaises(LockTimeout) as ctx:
+                with CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01):
+                    pass
+            msg = str(ctx.exception)
+            self.assertIn("portable lock-file backend", msg)
+            # The live holder is this process; its pid must be attributed.
+            self.assertIn(f"pid={os.getpid()}", msg)
+            self.assertIn("remove the lock file", msg)
+        finally:
+            held.__exit__()
+            CrossProcessLock.force_backend = original
+
+    @unittest.skipUnless(
+        state_module._fcntl is not None, "fcntl backend not available on this platform"
+    )
+    def test_fcntl_lock_timeout_guidance_forbids_deletion(self) -> None:
+        """The fcntl OS backend holds the lock on the open file in the kernel and
+        releases it automatically on exit/crash. Deleting the path does not
+        release it and is unsafe, so the timeout message must never recommend
+        removing the lock file."""
+        lock_dir = self._tmpdir()
+        lock_path = lock_dir / ".x.lock"
+        original = CrossProcessLock.force_backend
+        CrossProcessLock.force_backend = "fcntl"
+        held = CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01)
+        try:
+            held.__enter__()
+            with self.assertRaises(LockTimeout) as ctx:
+                with CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01):
+                    pass
+            msg = str(ctx.exception)
+            self.assertIn("'fcntl' OS lock backend", msg)
+            self.assertIn("Do NOT delete the lock file", msg)
+            self.assertNotIn("remove the lock file", msg)
+        finally:
+            held.__exit__()
+            CrossProcessLock.force_backend = original
 
     # -----------------------------------------------------------------------
     # 19. legacy state detection

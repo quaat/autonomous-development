@@ -1048,18 +1048,22 @@ def cmd_init(args: argparse.Namespace) -> int:
             }
             save_run_state(run_dir, state)
 
-    # Save repo metadata
-    meta = load_repo_metadata(state_home, repo.id)
-    meta.update(
-        {
-            "id": repo.id,
-            "display_name": repo.display_name,
-            "canonical_root": str(repo.canonical_root),
-            "remote_display": repo.remote_display,
-            "last_run_id": run_id,
-        }
-    )
-    save_repo_metadata(state_home, repo.id, meta)
+        # Save repo metadata while still holding RepoInitLock. Two concurrent
+        # `init --force` processes share this one metadata.json; updating it
+        # outside the lock would let their read-modify-write cycles interleave
+        # and lose one update (or observe a half-written file). Keeping it inside
+        # the repository-level lock serializes the metadata mutation too.
+        meta = load_repo_metadata(state_home, repo.id)
+        meta.update(
+            {
+                "id": repo.id,
+                "display_name": repo.display_name,
+                "canonical_root": str(repo.canonical_root),
+                "remote_display": repo.remote_display,
+                "last_run_id": run_id,
+            }
+        )
+        save_repo_metadata(state_home, repo.id, meta)
 
     print(run_dir / "run-state.json")
     return 0
@@ -1768,9 +1772,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
     accepted_risks = classify_feature_risk(md_text)
 
     # Stage each artifact to an invocation-unique temp path on the same filesystem
-    # so it can be published with an atomic os.replace under the lock. If anything
-    # fails, the staged files are removed and the canonical artifacts and state
-    # remain byte-identical.
+    # so it can be published with an atomic os.replace under the lock.
     stage_token = uuid.uuid4().hex
     staged: list[tuple[Path, Path]] = []  # (temp, canonical)
     md_tmp = run_dir / f".{md_name}.{stage_token}.tmp"
@@ -1785,24 +1787,57 @@ def cmd_accept(args: argparse.Namespace) -> int:
         with RunStateLock(run_dir):
             state = load_run_state(run_dir)
             require_active_run_state(state, run_id, "accept")
-            for tmp_path, canonical_path in staged:
-                os.replace(tmp_path, canonical_path)
-            state.setdefault("artifacts", {})[f"accepted_{kind}"] = md_name
-            if json_text is not None:
-                state["artifacts"][f"accepted_{kind}_json"] = json_name
-            state["phase"] = "spec-accepted" if kind == "spec" else "plan-accepted"
-            # Risk is sticky upward: if the accepted artifact reveals high-risk
-            # scope that the initial feature text did not, escalate the adversarial
-            # gate. Never downgrade an already-required gate here.
-            risk = state.setdefault("risk", {})
-            if accepted_risks and not risk.get("requires_adversarial_review"):
-                risk["requires_adversarial_review"] = True
-                risk.setdefault("reasons", []).append(
-                    f"accepted {kind} escalated to rigorous: detected "
-                    f"{', '.join(accepted_risks)}"
-                )
-            state["stop_gate_blocks"] = 0
-            save_run_state(run_dir, state)
+            # Publish all artifacts and the state as one all-or-nothing unit. Each
+            # canonical file that already exists is moved to an invocation-unique
+            # backup before being overwritten; on ANY failure (a later
+            # os.replace, the state save) every published artifact is rolled back
+            # to its pre-accept bytes, so a partial publication can never leave the
+            # canonical artifacts and run state inconsistent.
+            published: list[tuple[Path, Path | None]] = []  # (canonical, backup|None)
+            try:
+                for tmp_path, canonical_path in staged:
+                    backup: Path | None = None
+                    if canonical_path.exists():
+                        backup = canonical_path.with_name(
+                            f".{canonical_path.name}.{stage_token}.bak"
+                        )
+                        os.replace(canonical_path, backup)
+                    # Record before the publish replace so rollback can undo even
+                    # if this replace itself fails after the backup move.
+                    published.append((canonical_path, backup))
+                    os.replace(tmp_path, canonical_path)
+                state.setdefault("artifacts", {})[f"accepted_{kind}"] = md_name
+                if json_text is not None:
+                    state["artifacts"][f"accepted_{kind}_json"] = json_name
+                state["phase"] = "spec-accepted" if kind == "spec" else "plan-accepted"
+                # Risk is sticky upward: if the accepted artifact reveals high-risk
+                # scope that the initial feature text did not, escalate the
+                # adversarial gate. Never downgrade an already-required gate here.
+                risk = state.setdefault("risk", {})
+                if accepted_risks and not risk.get("requires_adversarial_review"):
+                    risk["requires_adversarial_review"] = True
+                    risk.setdefault("reasons", []).append(
+                        f"accepted {kind} escalated to rigorous: detected "
+                        f"{', '.join(accepted_risks)}"
+                    )
+                state["stop_gate_blocks"] = 0
+                save_run_state(run_dir, state)
+            except BaseException:
+                # Roll back published artifacts to their pre-accept state. The run
+                # state file is written atomically (temp+replace), so a failed save
+                # leaves the prior state intact; restoring the artifacts therefore
+                # restores full artifact/state consistency.
+                for canonical_path, backup in reversed(published):
+                    if backup is not None:
+                        if backup.exists():
+                            os.replace(backup, canonical_path)
+                    else:
+                        canonical_path.unlink(missing_ok=True)
+                raise
+            else:
+                for _canonical, backup in published:
+                    if backup is not None:
+                        backup.unlink(missing_ok=True)
     finally:
         for tmp_path, _ in staged:
             tmp_path.unlink(missing_ok=True)

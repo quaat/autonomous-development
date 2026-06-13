@@ -8,6 +8,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -279,13 +280,30 @@ def resolve_artifact_path(relative_or_abs: str, run_dir: Path) -> Path:
 
 
 def atomic_write_json(path: Path, value: dict) -> None:
-    """Write to a .tmp file then replace atomically."""
+    """Write to an invocation-unique temp file then replace atomically.
+
+    The temp file name is unique per call (PID + random token) rather than a
+    fixed ``<name>.tmp``: two concurrent writers to the same target (e.g. two
+    ``init --force`` processes updating one repository's metadata.json) would
+    otherwise race on the same temp path, with one truncating or replacing the
+    other's half-written file. A unique temp also lets a failed write be cleaned
+    up without clobbering an unrelated in-flight writer's staging file.
+    """
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    temp.replace(path)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp")
+    try:
+        temp.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        temp.replace(path)
+    except BaseException:
+        # Never leave a stray staging file behind on failure. The replace is the
+        # last step, so if it raised the temp may still exist.
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 try:  # POSIX advisory locking
@@ -339,6 +357,7 @@ class CrossProcessLock:
         self._fd: int | None = None
         self._backend: str | None = None
         self._holds_exclusive_file = False
+        self._owner_token = secrets.token_hex(8)
 
     def _select_backend(self) -> str:
         forced = type(self).force_backend
@@ -350,12 +369,64 @@ class CrossProcessLock:
             return "msvcrt"
         return "portable"
 
-    def _timeout_error(self) -> LockTimeout:
-        return LockTimeout(
-            f"Could not acquire lock {str(self._lock_path)!r} within "
-            f"{self._timeout:g}s. Another process may hold it; if no such "
-            "process exists the lock file can be removed manually."
+    def _owner_metadata(self) -> str:
+        """Owner record stamped into a portable lock file for stale-lock recovery."""
+        return json.dumps(
+            {
+                "pid": os.getpid(),
+                "host": socket.gethostname(),
+                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "token": self._owner_token,
+                "backend": "portable",
+            },
+            sort_keys=True,
         )
+
+    def _read_portable_owner(self) -> str:
+        """Best-effort description of the current portable lock-file owner."""
+        try:
+            info = json.loads(self._lock_path.read_text(encoding="utf-8"))
+            return (
+                f"The lock file records owner pid={info.get('pid')} "
+                f"host={info.get('host')!r} started_at={info.get('started_at')!r}."
+            )
+        except (OSError, ValueError):
+            return "The lock file records no readable owner metadata."
+
+    def _timeout_error(self) -> LockTimeout:
+        base = (
+            f"Could not acquire lock {str(self._lock_path)!r} within "
+            f"{self._timeout:g}s. "
+        )
+        if self._backend == "portable":
+            # The portable backend is a plain O_EXCL marker file, NOT a kernel
+            # lock, so a crashed holder can strand it. Removing it is the only
+            # recovery — but only once the recorded owner is known to be gone.
+            detail = (
+                "This is the portable lock-file backend (an atomic O_EXCL marker "
+                "file, not a kernel-held lock), so a crashed holder can leave it "
+                "behind. " + self._read_portable_owner() + " If that process is "
+                f"no longer running, remove the lock file ({str(self._lock_path)!r}) "
+                "to recover. Never remove it while the owning process is still "
+                "alive."
+            )
+        else:
+            # fcntl/msvcrt locks live on the open file description in the kernel
+            # and are released automatically when the holder exits or crashes.
+            # Deleting the pathname does NOT release such a lock and is unsafe: a
+            # new process could create a fresh file at the same path and acquire a
+            # second, conflicting lock while the original holder still holds it.
+            detail = (
+                f"This is the {self._backend!r} OS lock backend; the kernel holds "
+                "the lock on the open file and releases it automatically when the "
+                "owning process exits or crashes. A live holder is therefore "
+                "running now — wait for it to finish or stop that process. Do NOT "
+                "delete the lock file: the holder keeps its lock on the original "
+                "file even after the path is unlinked, so deleting the path lets "
+                "another process create a new file there and take a second, "
+                "conflicting lock."
+            )
+        return LockTimeout(base + detail)
 
     def __enter__(self) -> CrossProcessLock:
         self._lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -393,6 +464,13 @@ class CrossProcessLock:
                     0o600,
                 )
                 self._holds_exclusive_file = True
+                # Stamp owner metadata so a stranded lock from a crashed holder
+                # can be attributed (pid/host/start) during recovery. Best-effort:
+                # a write failure must not defeat the acquired lock.
+                try:
+                    os.write(self._fd, self._owner_metadata().encode("utf-8"))
+                except OSError:
+                    pass
                 return
             except FileExistsError:
                 if time.monotonic() >= deadline:
@@ -868,8 +946,14 @@ def resolve_run_for_transition(
 
     Read-resolution semantics (terminal runs are reachable, e.g. to archive a
     completed run). The caller enforces the transition table under the lock.
+    Lifecycle transitions (cancel/block/archive-run) mutate state, so the same
+    run-identity invariants enforced for active mutations must hold here too: a
+    tampered or misfiled run-state whose run_id or repository.id is missing or
+    inconsistent must not be transitioned under the wrong identity.
     """
-    return resolve_run_for_inspection(state_home, repo_id, repo_root, run_id)
+    ref = resolve_run_for_inspection(state_home, repo_id, repo_root, run_id)
+    verify_run_identity(ref, repo_id)
+    return ref
 
 
 def resolve_run_for_inspection(
