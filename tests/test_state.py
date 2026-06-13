@@ -35,6 +35,7 @@ from state import (  # noqa: E402
     resolve_run_for_inspection,
     run_dir_path,
     save_run_state,
+    validate_run_id,
     validate_state,
     atomic_write_json,
     LEGACY_STATE_FILE_NAME,
@@ -868,6 +869,107 @@ class StateModuleTests(unittest.TestCase):
         artifact_file.write_text("content", encoding="utf-8")
         resolved = resolve_artifact_path("output file é.txt", run_dir)
         self.assertEqual(resolved, artifact_file.resolve())
+
+
+class RunIdValidationTests(unittest.TestCase):
+    """P0: run-ID validation and path containment."""
+
+    def setUp(self) -> None:
+        self._tmpdirs: list[Path] = []
+
+    def tearDown(self) -> None:
+        for d in self._tmpdirs:
+            if d.exists():
+                shutil.rmtree(str(d), ignore_errors=True)
+
+    def _tmpdir(self) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(d)
+        return d
+
+    def test_valid_generated_run_id_passes(self) -> None:
+        rid = new_run_id()
+        self.assertEqual(validate_run_id(rid), rid)
+
+    def test_valid_custom_run_ids_pass(self) -> None:
+        for rid in ("legacy", "my-feature-run", "run_01.2", "A", "x" * 80):
+            with self.subTest(rid=rid):
+                self.assertEqual(validate_run_id(rid), rid)
+
+    def test_rejects_traversal_and_separators(self) -> None:
+        bad = [
+            "../../escape",
+            "/absolute/path",
+            "C:\\escape",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "",
+            "-leading-hyphen",
+            ".hidden",
+            "x" * 81,
+            "with space",
+            "tab\there",
+            "null\x00byte",
+            "newline\nhere",
+        ]
+        for rid in bad:
+            with self.subTest(rid=rid):
+                with self.assertRaises(StateError):
+                    validate_run_id(rid)
+
+    def test_non_string_run_id_rejected(self) -> None:
+        for rid in (123, None, ["a"], {"a": 1}):
+            with self.subTest(rid=rid):
+                with self.assertRaises(StateError):
+                    validate_run_id(rid)  # type: ignore[arg-type]
+
+    def test_run_dir_path_rejects_traversal(self) -> None:
+        state_home = self._tmpdir()
+        for rid in ("../../escape", "/etc/passwd", "a/b", ".."):
+            with self.subTest(rid=rid):
+                with self.assertRaises(StateError):
+                    run_dir_path(state_home, "repoid0000000001", rid)
+
+    def test_run_dir_path_confines_valid_id(self) -> None:
+        state_home = self._tmpdir()
+        run_dir = run_dir_path(state_home, "repoid0000000001", "valid-run-01")
+        runs_base = (
+            state_home / "repositories" / "repoid0000000001" / "runs"
+        ).resolve()
+        self.assertEqual(run_dir.parent, runs_base)
+
+    def test_run_dir_path_symlink_escape_rejected(self) -> None:
+        state_home = self._tmpdir()
+        runs_base = state_home / "repositories" / "repoid0000000001" / "runs"
+        runs_base.mkdir(parents=True, exist_ok=True)
+        outside = self._tmpdir() / "outside-target"
+        outside.mkdir(parents=True, exist_ok=True)
+        link = runs_base / "evil"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unsupported on this platform")
+        with self.assertRaises(StateError):
+            run_dir_path(state_home, "repoid0000000001", "evil")
+
+    def test_resolve_active_run_validates_run_id(self) -> None:
+        state_home = self._tmpdir()
+        repo_root = self._tmpdir()
+        with self.assertRaises(StateError):
+            resolve_active_run(
+                state_home, "repoid0000000001", repo_root, run_id="../../escape"
+            )
+
+    def test_validate_state_rejects_bad_run_id(self) -> None:
+        bad_state = {
+            "schema_version": 2,
+            "status": "active",
+            "run_id": "../../escape",
+        }
+        with self.assertRaises(StateError):
+            validate_state(bad_state)
 
 
 if __name__ == "__main__":

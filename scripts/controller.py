@@ -14,7 +14,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from state import (
@@ -636,9 +636,77 @@ def render_open_findings(state: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+_CANONICAL_FINDING_ID = re.compile(r"^F-(\d+)$")
+
+
 def _index_findings(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
     findings = state.get("cumulative_findings", [])
     return {f["id"]: f for f in findings if isinstance(f, dict) and "id" in f}
+
+
+def _canonical_id_allocator(
+    index: dict[str, dict[str, Any]], incoming_ids: list[str]
+) -> Callable[[], str]:
+    """Return an allocator that hands out fresh, collision-free canonical IDs.
+
+    Duplicate finding IDs must be remapped to a real `F-<n>` id (not a synthetic
+    `F-1#dup` key) so a triage entry — whose schema is `^F-[0-9]+$` — can still
+    reference the remapped finding. Seed the counter past every canonical id in
+    both the existing index and the incoming batch so a remapped id can never
+    collide with an id that appears later in the same review.
+    """
+    max_n = 0
+    for key in list(index) + list(incoming_ids):
+        m = _CANONICAL_FINDING_ID.match(str(key))
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+    counter = {"n": max_n}
+
+    def allocate() -> str:
+        counter["n"] += 1
+        candidate = f"F-{counter['n']}"
+        while candidate in index:
+            counter["n"] += 1
+            candidate = f"F-{counter['n']}"
+        return candidate
+
+    return allocate
+
+
+def migrate_cumulative_finding_ids(state: dict[str, Any]) -> None:
+    """Remap legacy synthetic finding IDs (`F-1#dup..`/`F-1#r..`) to canonical IDs.
+
+    Older runs recorded duplicate findings under unreferenceable synthetic keys.
+    Rewrite each to the next free `F-<n>`, preserving the original under
+    `legacy_id` and folding any `reused_id` into `source_id`. Never drop a
+    finding. Idempotent: once all IDs are canonical this is a no-op.
+    """
+    findings = state.get("cumulative_findings")
+    if not isinstance(findings, list):
+        return
+    max_n = 0
+    has_legacy = False
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        m = _CANONICAL_FINDING_ID.match(str(f.get("id", "")))
+        if m:
+            max_n = max(max_n, int(m.group(1)))
+        elif str(f.get("id", "")).strip():
+            has_legacy = True
+    if not has_legacy:
+        return
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        fid = str(f.get("id", ""))
+        if not fid.strip() or _CANONICAL_FINDING_ID.match(fid):
+            continue
+        max_n += 1
+        f.setdefault("legacy_id", fid)
+        if "reused_id" in f and "source_id" not in f:
+            f["source_id"] = f.pop("reused_id")
+        f["id"] = f"F-{max_n}"
 
 
 def _require_finding_items(items: list[Any], context: str) -> None:
@@ -661,28 +729,28 @@ def _require_finding_items(items: list[Any], context: str) -> None:
 
 def merge_full_review(state: dict[str, Any], parsed: dict[str, Any], round_num: int) -> None:
     """Seed the cumulative finding set from a round-1 full review."""
+    migrate_cumulative_finding_ids(state)
     index = _index_findings(state)
     findings = list(parsed.get("findings", []))
     _require_finding_items(findings, "findings")
-    for position, finding in enumerate(findings):
+    allocate = _canonical_id_allocator(index, [str(f["id"]) for f in findings])
+    for finding in findings:
         fid = finding["id"]
         # A full review can return two findings sharing one id: the schema
         # enforces id *format* (^F-[0-9]+$) but not uniqueness. Overwriting by
-        # id would silently drop the first entry — potentially a severe finding
-        # — from the seeded baseline (fail open). Preserve both by recording any
-        # colliding entry under a collision-safe id, mirroring merge_delta_review.
-        # The `position` suffix guarantees uniqueness even with 3+ duplicates,
-        # and the `#dup` prefix cannot match a real id or merge_delta_review's
-        # `#r` collision scheme.
+        # id would silently drop the first entry — potentially a severe finding —
+        # from the seeded baseline (fail open). Remap the colliding entry to a
+        # fresh canonical id (referenceable by triage) and record the model's
+        # original id under `source_id`.
         if fid in index:
-            collision_id = f"{fid}#dup{round_num}-{position}"
-            index[collision_id] = {
-                "id": collision_id,
+            new_id = allocate()
+            index[new_id] = {
+                "id": new_id,
                 "severity": finding.get("severity"),
                 "category": finding.get("category"),
                 "status": "open",
                 "round": round_num,
-                "reused_id": fid,
+                "source_id": fid,
             }
             continue
         index[fid] = {
@@ -699,6 +767,7 @@ def merge_delta_review(
     state: dict[str, Any], parsed: dict[str, Any], round_num: int
 ) -> None:
     """Merge a round-2+ delta review into the cumulative finding set."""
+    migrate_cumulative_finding_ids(state)
     index = _index_findings(state)
     new_items = list(parsed.get("new_findings", [])) + list(
         parsed.get("regressions", [])
@@ -713,23 +782,22 @@ def merge_delta_review(
         # delta flip it to a lower-severity reintroduction and unblock the gate.
         if fid in index and fid not in reintroduced_ids:
             index[fid]["status"] = "resolved"
-    for position, finding in enumerate(new_items):
+    allocate = _canonical_id_allocator(index, [str(f["id"]) for f in new_items])
+    for finding in new_items:
         existing = index.get(finding["id"])
         # Never let a delta overwrite an existing finding (any status): doing so
         # could downgrade or drop an unresolved critical/high. Preserve the
-        # original and record the colliding report under a collision-safe id.
-        # The `position` suffix keeps the id unique when several entries in the
-        # same round reuse one id (e.g. a critical followed by a low both `F-1`);
-        # a bare `#r<round>` key would itself overwrite, re-dropping a severe.
+        # original and remap the colliding report to a fresh canonical id so it
+        # stays referenceable by triage, recording the model's id as `source_id`.
         if existing is not None:
-            collision_id = f"{finding['id']}#r{round_num}-{position}"
-            index[collision_id] = {
-                "id": collision_id,
+            new_id = allocate()
+            index[new_id] = {
+                "id": new_id,
                 "severity": finding.get("severity"),
                 "category": finding.get("category"),
                 "status": "open",
                 "round": round_num,
-                "reused_id": finding["id"],
+                "source_id": finding["id"],
             }
             continue
         index[finding["id"]] = {
@@ -2684,7 +2752,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         return int(args.func(args))
-    except WorkflowError as exc:
+    except (WorkflowError, StateError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:

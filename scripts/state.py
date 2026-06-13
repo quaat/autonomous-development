@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -175,6 +176,32 @@ def new_run_id() -> str:
     return f"{stamp}-{secrets.token_hex(4)}"
 
 
+_RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+
+
+def validate_run_id(run_id: object) -> str:
+    """Validate a run ID for safe use as a single filesystem path segment.
+
+    A run ID is used directly as a directory name under the runs root. This is the
+    single canonical validator: a crafted CLI arg, migrated/legacy state, or loaded
+    run-state.json must not be able to escape the runs directory via absolute paths,
+    separators, or `..` traversal. Mirror this with the resolved-path containment
+    check in `run_dir_path`. Conforming v0.2 run IDs (produced by `new_run_id`)
+    always pass, so this is backward compatible.
+    """
+    if not isinstance(run_id, str):
+        raise StateError(
+            f"Run ID must be a string, got {type(run_id).__name__}."
+        )
+    if not _RUN_ID_PATTERN.match(run_id):
+        raise StateError(
+            f"Invalid run ID {run_id!r}: must match {_RUN_ID_PATTERN.pattern} "
+            "(one path segment of letters, digits, '.', '_', '-'; 1-80 chars; "
+            "no path separators, no leading '.', '/', or '\\', no traversal)."
+        )
+    return run_id
+
+
 # ---------------------------------------------------------------------------
 # Legacy state detection
 # ---------------------------------------------------------------------------
@@ -194,8 +221,20 @@ def detect_legacy_state(repo_root: Path) -> Path | None:
 
 
 def run_dir_path(state_home: Path, repo_id: str, run_id: str) -> Path:
-    """<state_home>/repositories/<repo_id>/runs/<run_id>/"""
-    return state_home / "repositories" / repo_id / "runs" / run_id
+    """<state_home>/repositories/<repo_id>/runs/<run_id>/
+
+    The single canonical run-directory constructor. Validates the run ID
+    lexically and confirms the resolved path stays within the runs root, so no
+    caller can concatenate an unvalidated run ID into a filesystem path.
+    """
+    validate_run_id(run_id)
+    runs_base = (state_home / "repositories" / repo_id / "runs").resolve()
+    candidate = (runs_base / run_id).resolve()
+    try:
+        candidate.relative_to(runs_base)
+    except ValueError:
+        raise StateError(f"Run directory escapes runs root: {run_id!r}")
+    return candidate
 
 
 def repo_metadata_path(state_home: Path, repo_id: str) -> Path:
@@ -298,6 +337,7 @@ def validate_state(state: dict) -> None:
         raise StateError("State is missing required field 'run_id'.")
     if not isinstance(state["run_id"], str):
         raise StateError("State field 'run_id' must be a string.")
+    validate_run_id(state["run_id"])
 
     schema_version = state.get("schema_version") or state.get("version")
     if schema_version is not None and schema_version not in (1, 2):
@@ -507,8 +547,7 @@ def resolve_active_run(
 ) -> RunRef:
     """Resolve the run to operate on."""
     if run_id is not None:
-        runs_dir = state_home / "repositories" / repo_id / "runs"
-        run_dir = runs_dir / run_id
+        run_dir = run_dir_path(state_home, repo_id, run_id)
         state = load_run_state(run_dir, required=True)
         return RunRef(run_id=run_id, run_dir=run_dir, state=state)
 

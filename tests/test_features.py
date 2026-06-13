@@ -186,8 +186,12 @@ class ReviewMergeTests(unittest.TestCase):
         severe = controller.cumulative_unresolved_severe(st)
         # The original open critical must still block completion.
         self.assertEqual([f["id"] for f in severe], ["F-1"])
-        ids = {f["id"] for f in st["cumulative_findings"]}
-        self.assertIn("F-1#r2-0", ids)
+        # The reused report is remapped to a fresh canonical id (referenceable by
+        # triage), recording the model's original id under source_id.
+        remapped = [f for f in st["cumulative_findings"] if f["id"] != "F-1"]
+        self.assertEqual(len(remapped), 1)
+        self.assertEqual(remapped[0]["source_id"], "F-1")
+        self.assertRegex(remapped[0]["id"], r"^F-\d+$")
 
     def test_full_review_duplicate_id_does_not_drop_severe(self) -> None:
         # The review schema enforces id *format* but not uniqueness, so a
@@ -215,8 +219,9 @@ class ReviewMergeTests(unittest.TestCase):
             f for f in st["cumulative_findings"] if f["id"] != "F-1"
         ]
         self.assertEqual(len(collision), 1)
-        self.assertEqual(collision[0]["reused_id"], "F-1")
-        self.assertTrue(collision[0]["id"].startswith("F-1#dup"))
+        self.assertEqual(collision[0]["source_id"], "F-1")
+        # The remapped id is a real canonical id, referenceable by triage.
+        self.assertRegex(collision[0]["id"], r"^F-\d+$")
 
     def test_full_review_triple_duplicate_id_all_preserved(self) -> None:
         # Three findings sharing one id must all survive with distinct ids so a
@@ -273,13 +278,18 @@ class DeltaContradictionTests(unittest.TestCase):
         index = {f["id"]: f for f in st["cumulative_findings"]}
         self.assertEqual(index["F-1"]["severity"], "high")
         self.assertEqual(index["F-1"]["status"], "open")
-        self.assertIn("F-1#r2-0", index)
+        # The reintroduced report is remapped to a fresh canonical id with
+        # source_id pointing back at the model's reused id.
+        remapped = [f for f in st["cumulative_findings"] if f["id"] != "F-1"]
+        self.assertEqual(len(remapped), 1)
+        self.assertEqual(remapped[0]["source_id"], "F-1")
+        self.assertRegex(remapped[0]["id"], r"^F-\d+$")
 
     def test_multiple_reused_ids_one_round_do_not_overwrite(self) -> None:
         # Two delta entries reusing the same id in one round must each get a
-        # distinct collision-safe key. A bare `#r<round>` key would make the
-        # second overwrite the first — and if the first is a critical and the
-        # second a low, the severe finding would vanish (fail open).
+        # distinct fresh canonical id. Overwriting by id would make the second
+        # overwrite the first — and if the first is a critical and the second a
+        # low, the severe finding would vanish (fail open).
         st: dict = {"cumulative_findings": []}
         controller.merge_full_review(
             st, {"findings": [{"id": "F-1", "severity": "high"}]}, 1
@@ -296,14 +306,111 @@ class DeltaContradictionTests(unittest.TestCase):
             },
             2,
         )
-        # Both reused-id reports survive under distinct keys.
+        # Both reused-id reports survive under distinct canonical ids.
         ids = [f["id"] for f in st["cumulative_findings"]]
         self.assertEqual(len(ids), len(set(ids)))
-        self.assertIn("F-1#r2-0", ids)
-        self.assertIn("F-1#r2-1", ids)
+        for fid in ids:
+            self.assertRegex(fid, r"^F-\d+$")
+        remapped = [f for f in st["cumulative_findings"] if f.get("source_id") == "F-1"]
+        self.assertEqual(len(remapped), 2)
         # The reintroduced critical still blocks the gate.
         severe = controller.cumulative_unresolved_severe(st)
         self.assertTrue(any(f["severity"] == "critical" for f in severe))
+
+    def test_remapped_ids_are_triage_referenceable(self) -> None:
+        # A remapped duplicate must get a real F-<n> id so triage (schema
+        # ^F-[0-9]+$) can reference and resolve it.
+        st: dict = {"cumulative_findings": []}
+        controller.merge_full_review(
+            st,
+            {
+                "findings": [
+                    {"id": "F-1", "severity": "critical"},
+                    {"id": "F-1", "severity": "high"},
+                ]
+            },
+            1,
+        )
+        for f in st["cumulative_findings"]:
+            self.assertRegex(f["id"], r"^F-\d+$")
+        # Resolving the remapped id via triage clears it from the gate.
+        remapped = next(f for f in st["cumulative_findings"] if f.get("source_id"))
+        controller.apply_triage_to_cumulative(
+            st,
+            [
+                {
+                    "finding_id": remapped["id"],
+                    "status": "resolved",
+                    "resolution": "fixed and covered by a regression test",
+                }
+            ],
+        )
+        resolved = next(
+            f for f in st["cumulative_findings"] if f["id"] == remapped["id"]
+        )
+        self.assertEqual(resolved["status"], "resolved")
+
+    def test_remap_does_not_collide_with_later_incoming_id(self) -> None:
+        # Duplicate F-1 must not be remapped onto F-2 that appears later in the
+        # same batch.
+        st: dict = {"cumulative_findings": []}
+        controller.merge_full_review(
+            st,
+            {
+                "findings": [
+                    {"id": "F-1", "severity": "high"},
+                    {"id": "F-1", "severity": "critical"},
+                    {"id": "F-2", "severity": "low"},
+                ]
+            },
+            1,
+        )
+        ids = [f["id"] for f in st["cumulative_findings"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn("F-2", ids)
+        # The remapped critical and the genuine F-2 must both survive.
+        self.assertEqual(len(ids), 3)
+
+    def test_migration_remaps_legacy_synthetic_ids(self) -> None:
+        # A pre-existing run with legacy synthetic ids gets normalized on the
+        # next merge without dropping any finding.
+        st: dict = {
+            "cumulative_findings": [
+                {"id": "F-1", "severity": "high", "status": "open", "round": 1},
+                {
+                    "id": "F-1#dup1-1",
+                    "severity": "critical",
+                    "status": "open",
+                    "round": 1,
+                    "reused_id": "F-1",
+                },
+                {
+                    "id": "F-2#r2-0",
+                    "severity": "high",
+                    "status": "open",
+                    "round": 2,
+                    "reused_id": "F-2",
+                },
+            ]
+        }
+        controller.migrate_cumulative_finding_ids(st)
+        ids = [f["id"] for f in st["cumulative_findings"]]
+        self.assertEqual(len(ids), 3)
+        for fid in ids:
+            self.assertRegex(fid, r"^F-\d+$")
+        # Legacy ids preserved for audit; reused_id folded into source_id.
+        migrated = [f for f in st["cumulative_findings"] if "legacy_id" in f]
+        self.assertEqual(len(migrated), 2)
+        for f in migrated:
+            self.assertIn("source_id", f)
+            self.assertNotIn("reused_id", f)
+        # Idempotent.
+        before = [dict(f) for f in st["cumulative_findings"]]
+        controller.migrate_cumulative_finding_ids(st)
+        self.assertEqual(st["cumulative_findings"], before)
+        # No severe finding was dropped.
+        severe = controller.cumulative_unresolved_severe(st)
+        self.assertEqual(len(severe), 3)
 
 
 class SchemaTypeValidationTests(unittest.TestCase):
