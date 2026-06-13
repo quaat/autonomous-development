@@ -413,41 +413,6 @@ class DeltaContradictionTests(unittest.TestCase):
         self.assertEqual(len(severe), 3)
 
 
-class SchemaTypeValidationTests(unittest.TestCase):
-    def test_mistyped_array_field_detected(self) -> None:
-        # new_findings as an object (not array) must be flagged.
-        bad = {
-            "verdict": "pass",
-            "summary": "s",
-            "resolved_findings": [],
-            "new_findings": {},
-            "regressions": [],
-            "affected_acceptance_criteria": [],
-            "confidence": 1.0,
-        }
-        violations = controller._schema_type_violations(
-            bad, "schemas/review-delta.schema.json"
-        )
-        self.assertIn("new_findings", violations)
-
-    def test_well_typed_payload_has_no_violations(self) -> None:
-        good = {
-            "verdict": "pass",
-            "summary": "s",
-            "resolved_findings": [],
-            "new_findings": [],
-            "regressions": [],
-            "affected_acceptance_criteria": [],
-            "confidence": 1.0,
-        }
-        self.assertEqual(
-            controller._schema_type_violations(
-                good, "schemas/review-delta.schema.json"
-            ),
-            [],
-        )
-
-
 class SourceSectionValidationTests(unittest.TestCase):
     def test_blank_spec_source_rejected(self) -> None:
         with self.assertRaises(controller.WorkflowError):
@@ -494,37 +459,6 @@ class SourceSectionValidationTests(unittest.TestCase):
         obj, _ = controller.materialize_acceptance("spec", source, {})
         self.assertEqual(len(obj["functional_requirements"]), 1)
 
-
-class CodexValidationTests(unittest.TestCase):
-    def test_missing_required_fields_detected(self) -> None:
-        missing = controller._missing_required_fields(
-            {"verdict": "pass"}, "schemas/review-delta.schema.json"
-        )
-        self.assertIn("summary", missing)
-        self.assertIn("new_findings", missing)
-
-    def test_unreadable_schema_fails_closed(self) -> None:
-        with self.assertRaises(controller.WorkflowError):
-            controller._missing_required_fields(
-                {"verdict": "pass"}, "schemas/does-not-exist.schema.json"
-            )
-
-    def test_complete_output_has_no_missing_fields(self) -> None:
-        complete = {
-            "verdict": "pass",
-            "summary": "s",
-            "resolved_findings": [],
-            "new_findings": [],
-            "regressions": [],
-            "affected_acceptance_criteria": [],
-            "confidence": 1.0,
-        }
-        self.assertEqual(
-            controller._missing_required_fields(
-                complete, "schemas/review-delta.schema.json"
-            ),
-            [],
-        )
 
 
 class DecisionValidationTests(unittest.TestCase):

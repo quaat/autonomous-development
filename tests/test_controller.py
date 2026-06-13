@@ -1091,5 +1091,373 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(final_state["phase"], "review-budget-exhausted")
 
 
+TERMINAL_STATUSES = ("complete", "blocked", "cancelled", "archived")
+
+
+class TerminalStateIntegrityTests(unittest.TestCase):
+    """P0 W1: terminal runs are immutable and cannot be resurrected.
+
+    These tests assert the run-access contracts end-to-end through the CLI:
+    a mutating command named with an explicit --run-id must refuse a terminal
+    run, read-only inspection must keep working on terminal runs, lifecycle
+    transitions must obey the transition table, and run-identity invariants
+    must be enforced.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdirs: list[Path] = []
+
+    def tearDown(self) -> None:
+        for d in self._tmpdirs:
+            if d.exists():
+                shutil.rmtree(str(d), ignore_errors=True)
+
+    # --- shared helpers (mirrors ControllerTests, kept local for isolation) ---
+
+    def make_repo(self) -> Path:
+        temp = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(temp)
+        subprocess.run(["git", "init", "-q", str(temp)], check=True)
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.name", "Test User"], check=True
+        )
+        (temp / "README.md").write_text("# Test\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(temp), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(temp), "commit", "-qm", "initial"], check=True)
+        return temp
+
+    def make_state_home(self) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(d)
+        return d
+
+    def run_controller(
+        self, repo: Path, *args: str, state_home: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        cmd = ["python3", str(CONTROLLER), "--project-root", str(repo)]
+        if state_home is not None:
+            cmd += ["--state-dir", str(state_home)]
+        cmd += list(args)
+        return subprocess.run(
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+    def init_run(self, repo: Path, state_home: Path, feature: str = "F") -> Path:
+        res = self.run_controller(
+            repo, "init", "--feature", feature, state_home=state_home
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return self._state_path(repo, state_home)
+
+    def _state_path(self, repo: Path, state_home: Path) -> Path:
+        repo_info = resolve_repository(repo)
+        runs = state_home / "repositories" / repo_info.id / "runs"
+        dirs = [d for d in runs.iterdir() if d.is_dir()]
+        self.assertEqual(len(dirs), 1, f"expected exactly one run dir, got {dirs}")
+        return dirs[0] / "run-state.json"
+
+    def _set_status(self, state_path: Path, status: str) -> str:
+        s = json.loads(state_path.read_text(encoding="utf-8"))
+        s["status"] = status
+        s["phase"] = status
+        state_path.write_text(json.dumps(s), encoding="utf-8")
+        return s["run_id"]
+
+    def _mutation_commands(self) -> list[tuple[str, list[str]]]:
+        ledger_dir = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(ledger_dir)
+        ledger = ledger_dir / "triage.json"
+        ledger.write_text(
+            json.dumps(
+                [{"fingerprint": "x.py:y", "status": "rejected", "reason": "r"}]
+            ),
+            encoding="utf-8",
+        )
+        spec = ledger_dir / "spec.md"
+        spec.write_text("spec", encoding="utf-8")
+        return [
+            ("run-check", ["run-check", "--name", "t", "--", "python3", "-c", "print(1)"]),
+            ("set-phase", ["set-phase", "--phase", "planning"]),
+            ("set-risk", ["set-risk", "--require-adversarial", "--reason", "x"]),
+            ("evaluate", ["evaluate"]),
+            ("accept-drift", ["accept-drift"]),
+            ("triage", ["triage", "--file", str(ledger)]),
+            ("accept", ["accept", "--kind", "spec", "--file", str(spec)]),
+            ("codex", ["codex", "--phase", "review"]),
+        ]
+
+    # --- tests ---
+
+    def test_terminal_runs_reject_every_mutation(self) -> None:
+        """Explicit-`--run-id` mutations must be refused for every terminal
+        status, the error must name the run id + status + operation, and the
+        persisted state bytes must be unchanged."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        commands = self._mutation_commands()
+
+        for status in TERMINAL_STATUSES:
+            run_id = self._set_status(state_path, status)
+            before = state_path.read_bytes()
+            for op, argv in commands:
+                with self.subTest(status=status, op=op):
+                    result = self.run_controller(
+                        repo, "--run-id", run_id, *argv, state_home=state_home
+                    )
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    err = result.stderr.lower()
+                    self.assertIn("terminal", err)
+                    self.assertIn(run_id, result.stderr)
+                    self.assertIn(status, result.stderr)
+                    # Immutability: the run-state file is byte-identical.
+                    self.assertEqual(state_path.read_bytes(), before)
+
+    def test_read_only_commands_inspect_every_terminal_status(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+
+        for status in TERMINAL_STATUSES:
+            run_id = self._set_status(state_path, status)
+            before = state_path.read_bytes()
+            inspections = [
+                ["status", "--run-id", run_id],
+                ["show-run", "--run-id", run_id],
+                ["usage-report", "--run-id", run_id],
+                ["next-action", "--run-id", run_id],
+                ["list-runs", "--all"],
+            ]
+            for argv in inspections:
+                with self.subTest(status=status, cmd=argv[0]):
+                    # Global --run-id must precede the subcommand; show-run takes
+                    # its run id as a subcommand option, the rest as global.
+                    if argv[0] == "show-run":
+                        result = self.run_controller(
+                            repo, *argv, state_home=state_home
+                        )
+                    elif argv[0] == "list-runs":
+                        result = self.run_controller(
+                            repo, *argv, state_home=state_home
+                        )
+                    else:
+                        result = self.run_controller(
+                            repo,
+                            "--run-id",
+                            run_id,
+                            argv[0],
+                            state_home=state_home,
+                        )
+                    self.assertEqual(
+                        result.returncode, 0, f"{argv[0]}: {result.stderr}"
+                    )
+                    self.assertEqual(state_path.read_bytes(), before)
+
+    def test_evaluate_cannot_resurrect_completed_run(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_id = self._set_status(state_path, "complete")
+        result = self.run_controller(
+            repo, "--run-id", run_id, "evaluate", state_home=state_home
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8"))["status"], "complete"
+        )
+
+    def test_cancel_and_block_cannot_rewrite_completed_run(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        for op in ("cancel", "block"):
+            run_id = self._set_status(state_path, "complete")
+            argv = [op] if op == "cancel" else [op, "--reason", "x"]
+            result = self.run_controller(
+                repo, "--run-id", run_id, *argv, state_home=state_home
+            )
+            with self.subTest(op=op):
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("only allowed from", result.stderr)
+                self.assertEqual(
+                    json.loads(state_path.read_text(encoding="utf-8"))["status"],
+                    "complete",
+                )
+
+    def test_active_run_cannot_be_archived(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_id = json.loads(state_path.read_text(encoding="utf-8"))["run_id"]
+        result = self.run_controller(
+            repo, "--run-id", run_id, "archive-run", state_home=state_home
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only allowed from", result.stderr)
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8"))["status"], "active"
+        )
+
+    def test_archive_is_idempotent_and_preserves_data(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_id = self._set_status(state_path, "complete")
+        first = self.run_controller(
+            repo, "--run-id", run_id, "archive-run", state_home=state_home
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        archived_bytes = state_path.read_bytes()
+        self.assertEqual(
+            json.loads(archived_bytes)["status"], "archived"
+        )
+        # Re-archiving is a no-op that must not alter any data.
+        second = self.run_controller(
+            repo, "--run-id", run_id, "archive-run", state_home=state_home
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("already archived", second.stdout)
+        self.assertEqual(state_path.read_bytes(), archived_bytes)
+
+    def test_init_cannot_overwrite_existing_terminal_run(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_id = self._set_status(state_path, "complete")
+        before = state_path.read_bytes()
+        # Even with --force, an existing run ID must not be clobbered.
+        result = self.run_controller(
+            repo,
+            "--run-id",
+            run_id,
+            "init",
+            "--feature",
+            "overwrite attempt",
+            "--force",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(state_path.read_bytes(), before)
+
+    def test_state_run_id_directory_mismatch_is_rejected(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        s = json.loads(state_path.read_text(encoding="utf-8"))
+        dir_name = state_path.parent.name
+        s["run_id"] = "tampered-does-not-match-dir"
+        state_path.write_text(json.dumps(s), encoding="utf-8")
+        result = self.run_controller(
+            repo, "--run-id", dir_name, "set-phase", "--phase", "planning",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match its run directory name", result.stderr)
+
+    def test_state_repository_id_mismatch_is_rejected(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        s = json.loads(state_path.read_text(encoding="utf-8"))
+        run_id = s["run_id"]
+        s["repository"]["id"] = "some-other-repo-id"
+        state_path.write_text(json.dumps(s), encoding="utf-8")
+        result = self.run_controller(
+            repo, "--run-id", run_id, "set-phase", "--phase", "planning",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("records repository", result.stderr)
+
+    def test_run_check_aborts_if_run_made_terminal_during_check(self) -> None:
+        """A concurrent cancel while the verification command runs must prevent
+        the check from being published (TOCTOU guard under the lock)."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_dir = state_path.parent
+
+        def fake_run_process(cmd, *, cwd, input_text=None, check=False, timeout=None):
+            mid = json.loads(state_path.read_text(encoding="utf-8"))
+            mid["status"] = "cancelled"
+            mid["phase"] = "cancelled"
+            state_path.write_text(json.dumps(mid), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+        original = controller.run_process
+        controller.run_process = fake_run_process
+        try:
+            args = argparse.Namespace(
+                project_root=str(repo),
+                state_dir=str(state_home),
+                run_id=None,
+                name="unit-tests",
+                command=["python3", "-c", "print(1)"],
+                timeout=None,
+                output="summary",
+                failure_tail_lines=80,
+            )
+            with self.assertRaises((controller.WorkflowError, Exception)) as ctx:
+                controller.cmd_run_check(args)
+        finally:
+            controller.run_process = original
+
+        self.assertIn("terminal", str(ctx.exception).lower())
+        final = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(final["status"], "cancelled")
+        # The check was never published to state.
+        self.assertEqual(final.get("verification", {}).get("checks", []), [])
+
+    def test_concurrent_same_run_id_inits_cannot_both_create(self) -> None:
+        """Two concurrent `init --run-id X` processes must not both materialize
+        the same run: exactly one wins, the other fails closed without
+        clobbering the survivor."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        run_id = "fixed-shared-run-id"
+
+        def spawn() -> subprocess.Popen[str]:
+            cmd = [
+                "python3", str(CONTROLLER),
+                "--project-root", str(repo),
+                "--state-dir", str(state_home),
+                "--run-id", run_id,
+                "init", "--feature", "concurrent",
+            ]
+            return subprocess.Popen(
+                cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+        p1 = spawn()
+        p2 = spawn()
+        out1 = p1.communicate()
+        out2 = p2.communicate()
+        codes = sorted([p1.returncode, p2.returncode])
+        # Exactly one wins (0); the loser fails closed (non-zero).
+        self.assertEqual(codes[0], 0, (out1, out2))
+        self.assertNotEqual(codes[1], 0, (out1, out2))
+        loser_err = out1[1] if p1.returncode != 0 else out2[1]
+        # The loser may lose at either guard depending on timing: the pre-init
+        # active-run check ("already exist") or the run-id overwrite protection
+        # ("already exists"). Both are correct fail-closed outcomes.
+        self.assertIn("already exist", loser_err)
+
+        # Exactly one run materialized and it is intact + active.
+        repo_info = resolve_repository(repo)
+        runs = state_home / "repositories" / repo_info.id / "runs"
+        dirs = [d for d in runs.iterdir() if d.is_dir()]
+        self.assertEqual(len(dirs), 1)
+        state = json.loads(
+            (dirs[0] / "run-state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(state["status"], "active")
+        self.assertEqual(state["run_id"], run_id)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,9 @@ name = "claude-codex-autonomous-development"
 version = "0.3.0"
 description = "Claude Code plugin for bounded autonomous feature development with Codex planning and review"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "jsonschema>=4.18",
+]
 
 [tool.ruff]
 line-length = 100

@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,29 @@ ROOT = Path(__file__).resolve().parents[1]
 def fail(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def _check_version_consistency(manifest: dict) -> str:
+    """Plugin manifest and pyproject must report the same version.
+
+    Releasing the plugin while the two manifests disagree (e.g. plugin.json
+    0.1.0 vs pyproject 0.3.0) misreports the shipped version to Claude Code's
+    plugin loader, so this is a release blocker enforced by the gate.
+    """
+    plugin_version = manifest.get("version", "")
+    pyproject = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    project_version = pyproject.get("project", {}).get("version", "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", plugin_version):
+        fail(f"Plugin version must be semver MAJOR.MINOR.PATCH, got {plugin_version!r}")
+    if plugin_version != project_version:
+        fail(
+            "Version mismatch: .claude-plugin/plugin.json reports "
+            f"{plugin_version!r} but pyproject.toml reports {project_version!r}. "
+            "Align both before releasing."
+        )
+    return plugin_version
 
 
 def _strict_required_violations(node: object, path: str) -> list[tuple[str, list[str]]]:
@@ -38,6 +62,8 @@ def main() -> int:
     )
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", manifest.get("name", "")):
         fail("Plugin name must be kebab-case")
+
+    version = _check_version_consistency(manifest)
 
     for schema in sorted((ROOT / "schemas").glob("*.json")):
         parsed = json.loads(schema.read_text(encoding="utf-8"))
@@ -96,7 +122,8 @@ def main() -> int:
             fail(f"Missing required file: {path}")
 
     print(
-        f'Validated {len(skills)} skills and {len(list((ROOT / "schemas").glob("*.json")))} schemas.'
+        f"Validated {len(skills)} skills and "
+        f'{len(list((ROOT / "schemas").glob("*.json")))} schemas at version {version}.'
     )
     return 0
 

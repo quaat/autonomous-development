@@ -38,10 +38,15 @@ from state import (
     find_all_runs,
     resolve_active_run,
     resolve_run_for_inspection,
+    resolve_run_for_active_mutation,
+    resolve_run_for_transition,
+    require_active_run_state,
+    assert_transition_allowed,
     detect_drift,
     repository_context,
     LEGACY_STATE_REL,
 )
+from schema_validation import SchemaValidationError, validate_payload
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 PHASE_OUTPUTS = {
@@ -437,73 +442,6 @@ def parse_codex_usage(ndjson_text: str) -> dict[str, int]:
                 if isinstance(val, int):
                     usage[dst] = val
     return usage
-
-
-def _missing_required_fields(parsed: dict[str, Any], schema_rel: str) -> list[str]:
-    """Top-level required keys the parsed Codex output is missing.
-
-    A lightweight, dependency-free local check against the bundled output schema
-    so the controller fails closed rather than trusting server-side enforcement
-    alone.
-    """
-    try:
-        schema = json.loads((PLUGIN_ROOT / schema_rel).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        # Fail closed: if the bundled schema cannot be loaded we cannot certify
-        # the Codex output, so we must not silently treat it as valid.
-        raise WorkflowError(
-            f"Cannot load output schema {schema_rel} for validation: {exc}"
-        ) from exc
-    required = schema.get("required", [])
-    if not isinstance(required, list):
-        raise WorkflowError(
-            f"Output schema {schema_rel} has no usable 'required' list; "
-            "refusing to validate fail-open."
-        )
-    return [key for key in required if key not in parsed]
-
-
-_JSON_TYPE_CHECKS = {
-    "array": list,
-    "object": dict,
-    "string": str,
-    "number": (int, float),
-    "integer": int,
-    "boolean": bool,
-}
-
-
-def _schema_type_violations(parsed: dict[str, Any], schema_rel: str) -> list[str]:
-    """Top-level properties whose value type disagrees with the bundled schema.
-
-    A dependency-free guard so a (e.g. downgraded) Codex CLI cannot slip a
-    top-level-complete but mistyped payload — such as ``new_findings: {}`` that
-    would iterate empty and silently suppress findings — past the merge.
-    """
-    try:
-        schema = json.loads((PLUGIN_ROOT / schema_rel).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WorkflowError(
-            f"Cannot load output schema {schema_rel} for validation: {exc}"
-        ) from exc
-    properties = schema.get("properties", {})
-    if not isinstance(properties, dict):
-        return []
-    violations: list[str] = []
-    for key, spec in properties.items():
-        if key not in parsed or not isinstance(spec, dict):
-            continue
-        declared = spec.get("type")
-        expected = _JSON_TYPE_CHECKS.get(declared) if isinstance(declared, str) else None
-        if expected is None:
-            continue
-        value = parsed[key]
-        # JSON has no bool/int distinction in `number`; reject bools for numbers.
-        if declared in {"number", "integer"} and isinstance(value, bool):
-            violations.append(key)
-        elif not isinstance(value, expected):
-            violations.append(key)
-    return violations
 
 
 def parse_codex_model(ndjson_text: str) -> str | None:
@@ -999,7 +937,24 @@ def cmd_init(args: argparse.Namespace) -> int:
     run_id = run_id_override or new_run_id()
     run_dir = run_dir_path(state_home, repo.id, run_id)
 
+    # Never overwrite an existing run, active or terminal. `--force` may create an
+    # additional run while another is active (handled above); it must not
+    # authorize clobbering an existing run ID's state.
+    if (run_dir / "run-state.json").exists():
+        raise WorkflowError(
+            f"A run with ID {run_id!r} already exists at {run_dir}. Refusing to "
+            "overwrite it. Use a different --run-id, `--reuse` to continue an "
+            "active run, or `archive-run`/`list-runs` to manage existing runs."
+        )
+
     with RunStateLock(run_dir):
+        # Re-check under the lock to close the TOCTOU window against a concurrent
+        # init creating the same run ID first.
+        if (run_dir / "run-state.json").exists():
+            raise WorkflowError(
+                f"A run with ID {run_id!r} already exists at {run_dir}. "
+                "Refusing to overwrite it."
+            )
         run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
 
         ctx_text = repository_context(repo)
@@ -1088,8 +1043,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_codex(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_ref = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override, operation="codex"
     )
     state = run_ref.state
     run_dir = run_ref.run_dir
@@ -1232,26 +1187,22 @@ def cmd_codex(args: argparse.Namespace) -> int:
             ) from exc
         if not isinstance(parsed, dict):
             raise WorkflowError(f"Codex output must be an object: {output_path}")
-        # Fail closed if a (e.g. downgraded) Codex CLI returns syntactically valid
-        # but schema-incomplete output: a delta review missing `new_findings` must
-        # not be silently treated as "no new findings" before the cumulative merge.
-        missing_fields = _missing_required_fields(parsed, schema_rel)
-        if missing_fields:
-            raise WorkflowError(
-                f"Codex {phase} output missing required field(s) "
-                f"{', '.join(missing_fields)} at {output_path}"
+        # Full Draft 2020-12 schema validation. Fail closed if a (e.g. downgraded)
+        # Codex CLI returns syntactically valid but schema-violating output: a
+        # delta review missing `new_findings`, a mistyped `new_findings: {}`, or a
+        # finding with an out-of-enum severity must all be rejected before the
+        # cumulative merge rather than silently mis-merged. This validates nested
+        # finding/criterion items too, not just top-level keys.
+        try:
+            validate_payload(
+                parsed, schema_rel, label=f"Codex {phase} output at {output_path}"
             )
-        type_violations = _schema_type_violations(parsed, schema_rel)
-        if type_violations:
-            raise WorkflowError(
-                f"Codex {phase} output has mistyped field(s) "
-                f"{', '.join(type_violations)} at {output_path}"
-            )
-        # Validate finding item shapes *before* publishing the canonical artifact
-        # under the lock. The cumulative merge fails closed on malformed finding
-        # entries; doing that check here (rather than only inside the locked
-        # merge) keeps a malformed payload from being renamed to its canonical
-        # name and left behind when the merge subsequently rejects it.
+        except SchemaValidationError as exc:
+            raise WorkflowError(str(exc)) from exc
+        # Defense in depth before publishing the canonical artifact under the lock:
+        # the cumulative merge also fails closed on malformed finding entries, but
+        # checking here keeps a malformed payload from being renamed to its
+        # canonical name and left behind when the merge subsequently rejects it.
         if phase == "review":
             if is_delta_review:
                 _require_finding_items(
@@ -1631,6 +1582,17 @@ def materialize_acceptance(
 ) -> tuple[dict[str, Any], str]:
     """Deterministically materialize an accepted spec/plan from a reconciliation delta."""
     _validate_source_sections(kind, source)
+    # Structural validation against the bundled decision schema first (rejects
+    # unknown keys / mistyped containers), then the semantic checks below which
+    # enforce non-empty reasons/replacements with targeted messages.
+    try:
+        validate_payload(
+            decisions,
+            "schemas/accept-decisions.schema.json",
+            label="Reconciliation decisions",
+        )
+    except SchemaValidationError as exc:
+        raise WorkflowError(str(exc)) from exc
     _validate_decision_shape(decisions)
     _validate_decision_ids(kind, source, decisions)
     reject_map, modify_map = _decision_maps(decisions)
@@ -1711,11 +1673,12 @@ def _resolve_source_path(
 
 def cmd_accept(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_ref = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override, operation="accept"
     )
     state = run_ref.state
     run_dir = run_ref.run_dir
+    run_id = run_ref.run_id
 
     require_no_unsafe_drift(state, repo)
 
@@ -1759,6 +1722,7 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        require_active_run_state(state, run_id, "accept")
         state.setdefault("artifacts", {})[f"accepted_{kind}"] = md_name
         if wrote_json:
             state["artifacts"][f"accepted_{kind}_json"] = json_name
@@ -1786,10 +1750,11 @@ def cmd_accept(args: argparse.Namespace) -> int:
 
 def cmd_run_check(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_ref = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override, operation="run-check"
     )
     run_dir = run_ref.run_dir
+    run_id = run_ref.run_id
 
     require_no_unsafe_drift(run_ref.state, repo)
 
@@ -1814,6 +1779,9 @@ def cmd_run_check(args: argparse.Namespace) -> int:
     # Acquire lock to compute a collision-free index and persist atomically.
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        # TOCTOU guard: a `cancel`/`block` may have driven the run terminal while
+        # this (possibly long) check ran. Publishing now would resurrect it.
+        require_active_run_state(state, run_id, "run-check")
         index = len(state.get("verification", {}).get("checks", [])) + 1
         log_path = verification_dir / f"{index:02d}-{slug(args.name)}.log"
         combined = (
@@ -1881,11 +1849,13 @@ def cmd_run_check(args: argparse.Namespace) -> int:
 
 def cmd_set_phase(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_dir = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
-    ).run_dir
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override, operation="set-phase"
+    )
+    run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        require_active_run_state(state, run_ref.run_id, "set-phase")
         require_no_unsafe_drift(state, repo)
         state["phase"] = args.phase
         if args.note:
@@ -1903,11 +1873,13 @@ def cmd_set_phase(args: argparse.Namespace) -> int:
 
 def cmd_set_risk(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_dir = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
-    ).run_dir
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override, operation="set-risk"
+    )
+    run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        require_active_run_state(state, run_ref.run_id, "set-risk")
         require_no_unsafe_drift(state, repo)
         risk = state.setdefault("risk", {})
         currently_required = bool(risk.get("requires_adversarial_review"))
@@ -1936,10 +1908,11 @@ def cmd_set_risk(args: argparse.Namespace) -> int:
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_ref = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override, operation="evaluate"
     )
     run_dir = run_ref.run_dir
+    run_id = run_ref.run_id
     # Drift check uses snapshot; git state is outside our file lock anyway.
     require_no_unsafe_drift(run_ref.state, repo)
 
@@ -1951,6 +1924,9 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     reasons: list[str] = []
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        # A concurrent cancel/block may have made the run terminal after
+        # resolution; evaluate must never flip a terminal run to complete/active.
+        require_active_run_state(state, run_id, "evaluate")
 
         for artifact_key, filename in (
             ("accepted_spec", "accepted-spec.md"),
@@ -2042,7 +2018,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
 
     if run_id_override:
-        run_ref = resolve_active_run(
+        run_ref = resolve_run_for_inspection(
             state_home, repo.id, repo.canonical_root, run_id_override
         )
         runs = [run_ref]
@@ -2114,11 +2090,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_dir = resolve_active_run(
+    run_ref = resolve_run_for_transition(
         state_home, repo.id, repo.canonical_root, run_id_override
-    ).run_dir
+    )
+    run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        assert_transition_allowed(state.get("status"), "cancel", run_ref.run_id)
         require_no_unsafe_drift(state, repo)
         state["status"] = "cancelled"
         state["phase"] = "cancelled"
@@ -2136,11 +2114,13 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
 def cmd_block(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_dir = resolve_active_run(
+    run_ref = resolve_run_for_transition(
         state_home, repo.id, repo.canonical_root, run_id_override
-    ).run_dir
+    )
+    run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        assert_transition_allowed(state.get("status"), "block", run_ref.run_id)
         require_no_unsafe_drift(state, repo)
         state["status"] = "blocked"
         state["phase"] = "blocked"
@@ -2203,7 +2183,9 @@ def cmd_show_run(args: argparse.Namespace) -> int:
 
     # run_id from --run-id arg on this subcommand, or global --run-id
     run_id = getattr(args, "show_run_id", None) or run_id_override
-    run_ref = resolve_active_run(state_home, repo.id, repo.canonical_root, run_id)
+    run_ref = resolve_run_for_inspection(
+        state_home, repo.id, repo.canonical_root, run_id
+    )
 
     if args.json:
         print(json.dumps(run_ref.state, indent=2, sort_keys=True))
@@ -2306,13 +2288,19 @@ def cmd_migrate_legacy_state(args: argparse.Namespace) -> int:
 
 def cmd_archive_run(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_ref = resolve_active_run(
+    run_ref = resolve_run_for_transition(
         state_home, repo.id, repo.canonical_root, run_id_override
     )
     run_id_str = run_ref.run_id
     run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        # Idempotent: re-archiving an archived run is a no-op that must not alter
+        # any other data.
+        if state.get("status") == "archived":
+            print(f"Run {run_id_str!r} is already archived.")
+            return 0
+        assert_transition_allowed(state.get("status"), "archive-run", run_id_str)
         require_no_unsafe_drift(state, repo)
         state["status"] = "archived"
         state.setdefault("notes", []).append(f"Archived at {utc_now()}")
@@ -2328,11 +2316,17 @@ def cmd_archive_run(args: argparse.Namespace) -> int:
 
 def cmd_accept_drift(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_dir = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
-    ).run_dir
+    run_ref = resolve_run_for_active_mutation(
+        state_home,
+        repo.id,
+        repo.canonical_root,
+        run_id_override,
+        operation="accept-drift",
+    )
+    run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        require_active_run_state(state, run_ref.run_id, "accept-drift")
         old_baseline = dict(state.get("baseline", {}))
         old_repo_block = dict(state.get("repository", {}))
 
@@ -2415,9 +2409,10 @@ def cmd_usage_report(args: argparse.Namespace) -> int:
 
 def cmd_triage(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_dir = resolve_active_run(
-        state_home, repo.id, repo.canonical_root, run_id_override
-    ).run_dir
+    run_ref = resolve_run_for_active_mutation(
+        state_home, repo.id, repo.canonical_root, run_id_override, operation="triage"
+    )
+    run_dir = run_ref.run_dir
 
     file_path = _resolve_source_path(args.file, run_dir, label="Triage ledger")
     try:
@@ -2429,6 +2424,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        require_active_run_state(state, run_ref.run_id, "triage")
         require_no_unsafe_drift(state, repo)
         ledger = state.setdefault("review_ledger", [])
         index = {
@@ -2572,7 +2568,7 @@ def compute_next_action(state: dict[str, Any], run_dir: Path) -> dict[str, Any]:
 
 def cmd_next_action(args: argparse.Namespace) -> int:
     repo, state_home, run_id_override = get_context(args)
-    run_ref = resolve_active_run(
+    run_ref = resolve_run_for_inspection(
         state_home, repo.id, repo.canonical_root, run_id_override
     )
     info = compute_next_action(run_ref.state, run_ref.run_dir)

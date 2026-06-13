@@ -589,6 +589,140 @@ def resolve_active_run(
     )
 
 
+# ---------------------------------------------------------------------------
+# Terminal-state and mutation-integrity policy
+# ---------------------------------------------------------------------------
+#
+# Three explicit run-access contracts replace the ambiguous historical use of
+# `resolve_active_run` for both reads and writes:
+#
+#   * resolve_run_for_inspection      — read-only; may resolve terminal runs.
+#   * resolve_run_for_active_mutation — refuses terminal runs (even with an
+#                                       explicit --run-id) so a completed,
+#                                       blocked, cancelled, or archived run can
+#                                       never be mutated or resurrected.
+#   * resolve_run_for_transition      — lifecycle commands that must read a
+#                                       terminal run (e.g. archiving a complete
+#                                       run); the caller enforces the transition
+#                                       table via `assert_transition_allowed`.
+#
+# Mutating commands additionally re-assert the status under the run lock (see
+# `require_active_run_state`) immediately before publishing, closing the TOCTOU
+# window between resolution and the locked write.
+
+# Lifecycle transition table: operation -> (allowed source statuses, target).
+# Centralized so status checks are not duplicated (and silently diverge) across
+# command handlers. No operation may move a terminal run back to "active".
+TRANSITION_POLICY: dict[str, tuple[frozenset[str], str]] = {
+    "cancel": (frozenset({"active"}), "cancelled"),
+    "block": (frozenset({"active"}), "blocked"),
+    "archive-run": (frozenset({"complete", "blocked", "cancelled"}), "archived"),
+}
+
+
+def _terminal_mutation_error(run_id: str, status: str, operation: str) -> StateError:
+    return StateError(
+        f"Cannot {operation} run {run_id!r}: its status is {status!r} (terminal). "
+        f"Terminal runs are immutable and cannot be mutated or resurrected. "
+        f"Inspect it with `status --run-id {run_id}` or start a new run with "
+        f"`init --feature ...`."
+    )
+
+
+def require_active_run_state(state: dict, run_id: str, operation: str) -> None:
+    """Raise if `state` is terminal. Call after reloading under the run lock.
+
+    This is the TOCTOU guard: a long-running operation (a verification check or a
+    Codex exec) may have been cancelled/blocked while it ran, so the freshly
+    reloaded status must be re-checked before publishing, or the write would
+    resurrect a terminal run.
+    """
+    status = state.get("status")
+    if status in TERMINAL_STATUSES:
+        raise _terminal_mutation_error(run_id, str(status), operation)
+
+
+def verify_run_identity(ref: RunRef, repo_id: str) -> None:
+    """Enforce run-identity invariants for the external state layout.
+
+    state.run_id must equal the run directory name and state.repository.id must
+    match the selected repository, so a tampered or misfiled run-state cannot be
+    mutated under the wrong identity. The legacy in-repo layout (run_dir is the
+    `.ai/autonomous-development` directory, not `runs/<run_id>`) is exempt.
+    """
+    if ref.run_dir.parent.name != "runs":
+        return  # legacy compatibility path
+    recorded_id = ref.state.get("run_id")
+    if recorded_id != ref.run_dir.name:
+        raise StateError(
+            f"State integrity error: run-state run_id {recorded_id!r} does not "
+            f"match its run directory name {ref.run_dir.name!r}."
+        )
+    recorded_repo = ref.state.get("repository", {})
+    recorded_repo_id = (
+        recorded_repo.get("id") if isinstance(recorded_repo, dict) else None
+    )
+    if recorded_repo_id and recorded_repo_id != repo_id:
+        raise StateError(
+            f"State integrity error: run {ref.run_dir.name!r} records repository "
+            f"{recorded_repo_id!r} but the current repository is {repo_id!r}."
+        )
+
+
+def assert_transition_allowed(
+    current_status: str, operation: str, run_id: str
+) -> None:
+    """Enforce the lifecycle transition table. Call under the run lock."""
+    allowed, _target = TRANSITION_POLICY[operation]
+    if current_status not in allowed:
+        raise StateError(
+            f"Cannot {operation} run {run_id!r}: current status is "
+            f"{current_status!r}; {operation} is only allowed from "
+            f"{sorted(allowed)}. This prevents resurrecting or overwriting a "
+            f"terminal run."
+        )
+
+
+def resolve_run_for_active_mutation(
+    state_home: Path,
+    repo_id: str,
+    repo_root: Path,
+    run_id: str | None = None,
+    *,
+    operation: str = "mutate",
+    allow_multiple: bool = False,
+) -> RunRef:
+    """Resolve a run for a state-changing command, refusing terminal runs.
+
+    Mirrors `resolve_active_run` but additionally (a) rejects a terminal run even
+    when named by an explicit --run-id, and (b) enforces run-identity invariants.
+    Handlers must still re-assert the status under the lock with
+    `require_active_run_state` before publishing.
+    """
+    ref = resolve_active_run(
+        state_home, repo_id, repo_root, run_id, allow_multiple=allow_multiple
+    )
+    verify_run_identity(ref, repo_id)
+    status = ref.state.get("status")
+    if status in TERMINAL_STATUSES:
+        raise _terminal_mutation_error(ref.run_id, str(status), operation)
+    return ref
+
+
+def resolve_run_for_transition(
+    state_home: Path,
+    repo_id: str,
+    repo_root: Path,
+    run_id: str | None = None,
+) -> RunRef:
+    """Resolve a run for a lifecycle transition that may target a terminal run.
+
+    Read-resolution semantics (terminal runs are reachable, e.g. to archive a
+    completed run). The caller enforces the transition table under the lock.
+    """
+    return resolve_run_for_inspection(state_home, repo_id, repo_root, run_id)
+
+
 def resolve_run_for_inspection(
     state_home: Path,
     repo_id: str,
