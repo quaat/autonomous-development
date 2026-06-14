@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -328,6 +329,9 @@ def prompt_values(run_dir: Path, state: dict[str, Any]) -> dict[str, str]:
         "FINDING_LEDGER": finding_ledger,
         "OPEN_FINDINGS": render_open_findings(state),
         "ACCEPTANCE_CRITERIA": render_acceptance_criteria(state),
+        # Overridden with the real path list for delta reviews in cmd_codex (which
+        # has repo access to fingerprint the current worktree).
+        "CHANGED_SINCE_LAST_REVIEW": "(not applicable to this phase)",
     }
 
 
@@ -539,6 +543,11 @@ def render_finding_ledger(state: dict[str, Any]) -> str:
             "fingerprint": entry.get("fingerprint"),
             "status": entry.get("status"),
         }
+        # Surface the canonical finding id so the reviewer can correlate a triage
+        # disposition with the `F-<n>` id it references (e.g. to avoid re-raising
+        # a finding already rejected/resolved under that id).
+        if entry.get("finding_id"):
+            item["finding_id"] = entry["finding_id"]
         if entry.get("resolution"):
             item["resolution"] = entry["resolution"]
         if entry.get("reason"):
@@ -604,6 +613,122 @@ def render_acceptance_criteria(state: dict[str, Any]) -> str:
     if not items:
         return "(none)"
     return json.dumps(items, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Review checkpoints (focused-full-fallback delta)
+# ---------------------------------------------------------------------------
+
+# A review record stores a checkpoint of the worktree it reviewed so a later
+# round can identify what changed since. We cannot reconstruct an *exact*
+# review-to-review patch from this (we do not retain prior file content), so the
+# delta reviewer is asked to review the full current feature diff while focusing
+# on the paths changed since the previous checkpoint. The prompt states this
+# explicitly rather than claiming a true review-to-review delta.
+REVIEW_CONTEXT_MODE = "focused_full_fallback"
+
+
+def _feature_changed_paths(repo: RepoInfo, baseline_commit: str | None) -> list[str]:
+    """Paths that differ from the feature baseline (committed or in the worktree).
+
+    The union of (a) the diff between the baseline commit and the current worktree
+    for tracked files and (b) `git status --porcelain` entries (which also surface
+    untracked files). Best-effort: git failures degrade to whatever was collected.
+    """
+    root = repo.canonical_root
+    paths: set[str] = set()
+    if baseline_commit:
+        diff = git(root, "diff", "--name-only", baseline_commit, check=False)
+        paths.update(p.strip() for p in diff.splitlines() if p.strip())
+    status = git(root, "status", "--porcelain", check=False)
+    for line in status.splitlines():
+        entry = line[3:].strip() if len(line) > 3 else ""
+        if not entry:
+            continue
+        if " -> " in entry:  # rename/copy: record the destination path
+            entry = entry.split(" -> ", 1)[1]
+        paths.add(entry.strip().strip('"'))
+    return sorted(paths)
+
+
+def _path_fingerprints(root: Path, paths: list[str]) -> dict[str, str | None]:
+    """sha256 of each path's current bytes; None if deleted/unreadable."""
+    fingerprints: dict[str, str | None] = {}
+    for rel in paths:
+        try:
+            data = (root / rel).read_bytes()
+        except OSError:
+            fingerprints[rel] = None
+            continue
+        fingerprints[rel] = "sha256:" + hashlib.sha256(data).hexdigest()
+    return fingerprints
+
+
+def _latest_review_checkpoint(state: dict[str, Any]) -> dict[str, Any] | None:
+    for review in reversed(state.get("reviews", [])):
+        if isinstance(review, dict) and isinstance(review.get("checkpoint"), dict):
+            return review["checkpoint"]
+    return None
+
+
+def capture_review_checkpoint(
+    repo: RepoInfo, state: dict[str, Any], *, checkpoint_id: str
+) -> dict[str, Any]:
+    """Snapshot the worktree this review round saw, for later change detection.
+
+    Call this *before* appending the current round's review record so
+    `previous_checkpoint_id` resolves to the prior round.
+    """
+    baseline_commit = (state.get("baseline") or {}).get("commit")
+    changed = _feature_changed_paths(repo, baseline_commit)
+    previous = _latest_review_checkpoint(state)
+    return {
+        "id": checkpoint_id,
+        "captured_at": utc_now(),
+        "head_commit": repo.head_commit,
+        "branch": repo.branch,
+        "baseline_commit": baseline_commit,
+        "changed_paths": changed,
+        "path_fingerprints": _path_fingerprints(repo.canonical_root, changed),
+        "previous_checkpoint_id": previous.get("id") if previous else None,
+        "review_context_mode": REVIEW_CONTEXT_MODE,
+    }
+
+
+def changed_paths_since_last_review(
+    repo: RepoInfo, state: dict[str, Any]
+) -> list[str] | None:
+    """Feature paths whose current content differs from the last review checkpoint.
+
+    Returns None when there is no prior checkpoint (the next review is effectively
+    a full review). A path counts as changed when its current fingerprint differs
+    from the checkpoint's, when it is newly part of the feature diff, or when it
+    was in the checkpoint but is no longer part of the feature diff (reverted).
+    """
+    previous = _latest_review_checkpoint(state)
+    if previous is None or not isinstance(previous.get("path_fingerprints"), dict):
+        return None
+    previous_fps = previous["path_fingerprints"]
+    baseline_commit = (state.get("baseline") or {}).get("commit")
+    current_paths = _feature_changed_paths(repo, baseline_commit)
+    current_fps = _path_fingerprints(repo.canonical_root, current_paths)
+    changed: set[str] = set()
+    for path, fingerprint in current_fps.items():
+        if previous_fps.get(path) != fingerprint:
+            changed.add(path)
+    for path in previous_fps:
+        if path not in current_fps:
+            changed.add(path)
+    return sorted(changed)
+
+
+def render_changed_since_previous(repo: RepoInfo, state: dict[str, Any]) -> str:
+    changed = changed_paths_since_last_review(repo, state)
+    if changed is None:
+        return "(no prior review checkpoint; treat this as a full review)"
+    if not changed:
+        return "(no file changes detected since the previous review checkpoint)"
+    return json.dumps(changed, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +844,14 @@ def _cumulative_finding(
         "severity": finding.get("severity"),
         "category": finding.get("category"),
         "status": status,
+        # `round` is retained for backward compatibility (it is the round the
+        # finding was opened). `round_opened`/`round_last_seen` make the audit
+        # trail explicit: a carried-forward finding keeps `round_last_seen` at the
+        # last round a reviewer actually reported it (delta reviews only report
+        # changes), so "we have not re-confirmed this since round N" is legible.
         "round": round_num,
+        "round_opened": round_num,
+        "round_last_seen": round_num,
         "origin": origin,
     }
     for key, default in _FINDING_EVIDENCE_DEFAULTS.items():
@@ -745,6 +877,10 @@ def _finalize_cumulative(
         entry.setdefault("origin", "legacy")
         for key, default in _FINDING_EVIDENCE_DEFAULTS.items():
             entry.setdefault(key, default)
+        # Backfill round metadata for entries recorded before it was tracked.
+        opened = entry.get("round")
+        entry.setdefault("round_opened", opened)
+        entry.setdefault("round_last_seen", opened)
     return list(index.values())
 
 
@@ -814,13 +950,41 @@ def merge_delta_review(
     _require_finding_items(new_findings, "new_findings")
     _require_finding_items(regressions, "regressions")
     reintroduced_ids = {f["id"] for f in new_findings} | {f["id"] for f in regressions}
-    for fid in parsed.get("resolved_findings", []):
-        # Fail closed: an id cannot be both resolved and (re)reported as a new
-        # finding/regression in the same round. Leaving the original untouched
-        # keeps a severe finding blocking rather than letting the contradictory
-        # delta flip it to a lower-severity reintroduction and unblock the gate.
-        if fid in index and fid not in reintroduced_ids:
-            index[fid]["status"] = "resolved"
+    resolved_ids = list(parsed.get("resolved_findings", []))
+    resolution_source = f"review-{round_num:02d}"
+    seen_resolved: set[str] = set()
+    for fid in resolved_ids:
+        # Fail closed on a resolution claim that cannot be substantiated, rather
+        # than silently ignoring it (which would let a delta *appear* to close a
+        # finding while leaving the ledger — and the gate — unaffected, or worse,
+        # mask a contradiction).
+        #   * duplicate id within resolved_findings: the reviewer cannot resolve
+        #     the same finding twice in one round;
+        #   * unknown id (not in the cumulative ledger): there is nothing to
+        #     resolve, so the claim is spurious;
+        #   * id also reported as a new finding/regression this round: a finding
+        #     cannot be simultaneously resolved and reintroduced.
+        if fid in seen_resolved:
+            raise WorkflowError(
+                f"Codex delta review resolves finding {fid!r} more than once; "
+                "refusing to merge (fail closed)."
+            )
+        seen_resolved.add(fid)
+        if fid not in index:
+            raise WorkflowError(
+                f"Codex delta review resolves unknown finding {fid!r} (not in the "
+                "cumulative ledger); refusing to merge (fail closed)."
+            )
+        if fid in reintroduced_ids:
+            raise WorkflowError(
+                f"Codex delta review reports finding {fid!r} as both resolved and "
+                "reintroduced (new finding/regression); refusing to merge "
+                "(fail closed)."
+            )
+        finding = index[fid]
+        finding["status"] = "resolved"
+        finding["resolved_at_round"] = round_num
+        finding["resolution_source"] = resolution_source
     incoming_ids = [str(f["id"]) for f in new_findings] + [
         str(f["id"]) for f in regressions
     ]
@@ -987,6 +1151,42 @@ def cumulative_unresolved_severe(state: dict[str, Any]) -> list[dict[str, Any]]:
         if is_severe and not released:
             severe.append(f)
     return severe
+
+
+# The only acceptance-criteria status that does not block completion. Everything
+# else — `not_satisfied`, `partially_satisfied`, `not_verifiable`, and any
+# missing/unknown value — blocks (fail closed): a reviewer cannot mark a run
+# complete while a criterion is unmet or unverifiable.
+SATISFIED_ACCEPTANCE_STATUS = "satisfied"
+
+
+def blocking_acceptance_criteria(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Cumulative acceptance criteria that are not `satisfied` (fail closed)."""
+    blocking: list[dict[str, Any]] = []
+    for criterion in state.get("cumulative_acceptance_criteria", []):
+        if not isinstance(criterion, dict):
+            blocking.append({"id": "(malformed)", "status": "(unknown)"})
+            continue
+        if criterion.get("status") != SATISFIED_ACCEPTANCE_STATUS:
+            blocking.append(criterion)
+    return blocking
+
+
+def _describe_blocking_acceptance_criteria(
+    blocking: list[dict[str, Any]], *, limit: int = 5
+) -> str:
+    parts: list[str] = []
+    for criterion in blocking[:limit]:
+        cid = criterion.get("id", "(no id)") if isinstance(criterion, dict) else "(?)"
+        status = (
+            criterion.get("status", "(no status)")
+            if isinstance(criterion, dict)
+            else "(?)"
+        )
+        parts.append(f"{cid} [{status}]")
+    if len(blocking) > limit:
+        parts.append(f"(+{len(blocking) - limit} more)")
+    return "; ".join(parts)
 
 
 def _describe_blocking_findings(
@@ -1355,7 +1555,10 @@ def cmd_codex(args: argparse.Namespace) -> int:
         assert output_name is not None
 
     template = (PLUGIN_ROOT / prompt_rel).read_text(encoding="utf-8")
-    prompt = render(template, prompt_values(run_dir, state))
+    values = prompt_values(run_dir, state)
+    if is_delta_review:
+        values["CHANGED_SINCE_LAST_REVIEW"] = render_changed_since_previous(repo, state)
+    prompt = render(template, values)
     prompt_path = run_dir / f"{phase}.prompt.md"
     prompt_path.write_text(prompt, encoding="utf-8")
     # Stage Codex output/events under invocation-unique names so a concurrent or
@@ -1395,17 +1598,42 @@ def cmd_codex(args: argparse.Namespace) -> int:
     events_path = run_dir / f".staging-{stage_id}.events.ndjson"
 
     if result.returncode != 0:
-        error_path = run_dir / f"{phase}.codex.stderr.log"
-        error_path.write_text(result.stderr, encoding="utf-8")
+        # Stage the failure log under an invocation-unique name first. The status
+        # was checked before the (long) Codex exec; a concurrent cancel/block may
+        # have driven the run terminal while Codex ran. Publishing the canonical
+        # error log and appending a note without re-checking would mutate — and so
+        # resurrect — a terminal run. Re-validate identity and exact-active status
+        # under the lock, and only then publish; otherwise leave the run untouched.
+        staged_error = run_dir / f".staging-{stage_id}.stderr.log"
+        staged_error.write_text(result.stderr, encoding="utf-8")
         for staged in (output_path, events_path):
             staged.unlink(missing_ok=True)
+        codex_failure = result.stderr.strip() or f"Codex {phase} failed"
         with RunStateLock(run_dir):
             err_state = load_run_state(run_dir)
+            verify_loaded_run_identity(
+                err_state, run_dir=run_dir, expected_repo_id=repo.id
+            )
+            try:
+                require_active_run_state(
+                    err_state, run_ref.run_id, f"record Codex {phase} failure"
+                )
+            except WorkflowError as status_exc:
+                # The run became terminal while Codex ran. Do not modify it: drop
+                # the staged log and report both the Codex failure and the status
+                # change without touching the run.
+                staged_error.unlink(missing_ok=True)
+                raise WorkflowError(
+                    f"Codex {phase} failed ({codex_failure}); the run is no "
+                    f"longer active and was left unchanged: {status_exc}"
+                ) from status_exc
+            error_path = run_dir / f"{phase}.codex.stderr.log"
+            staged_error.replace(error_path)
             err_state.setdefault("notes", []).append(
                 f"Codex {phase} failed; see {make_relative_path(error_path, run_dir)}"
             )
             save_run_state(run_dir, err_state)
-        raise WorkflowError(result.stderr.strip() or f"Codex {phase} failed")
+        raise WorkflowError(codex_failure)
 
     # Any failure after this point (NDJSON staging, parse, schema validation,
     # locked merge) must not leave the invocation-unique staging files on disk:
@@ -1551,12 +1779,18 @@ def cmd_codex(args: argparse.Namespace) -> int:
             elif phase == "review":
                 state["review_round"] = next_round
                 state["phase"] = "reviewed"
+                # Capture the checkpoint before appending so previous_checkpoint_id
+                # resolves to the prior round's checkpoint.
+                checkpoint = capture_review_checkpoint(
+                    repo, state, checkpoint_id=phase_label
+                )
                 state.setdefault("reviews", []).append(
                     {
                         "round": next_round,
                         "path": make_relative_path(final_path, run_dir),
                         "verdict": parsed.get("verdict"),
                         "delta": is_delta_review,
+                        "checkpoint": checkpoint,
                     }
                 )
                 if is_delta_review:
@@ -2279,9 +2513,10 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
             except (StateError, OSError, json.JSONDecodeError) as exc:
                 reasons.append(f"Could not read latest review: {exc}")
                 review = {}
-            if review.get("verdict") != "pass":
+            verdict = review.get("verdict")
+            if verdict != "pass":
                 reasons.append(
-                    f"Latest Codex review verdict is {review.get('verdict')}"
+                    f"Latest Codex review verdict is {verdict}"
                 )
             # Prefer the cumulative finding ledger (full-then-delta reviews); fall
             # back to the latest review object only when no ledger exists. A
@@ -2296,6 +2531,25 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 reasons.append(
                     f"{len(severe)} unresolved critical/high finding(s) in "
                     f"review ledger: {_describe_blocking_findings(severe)}"
+                )
+            # Completion requires every acceptance criterion to be satisfied
+            # (fail closed). A criterion left not_satisfied/partially_satisfied/
+            # not_verifiable blocks the gate.
+            blocking_ac = blocking_acceptance_criteria(state)
+            if blocking_ac:
+                reasons.append(
+                    f"{len(blocking_ac)} acceptance criteria not satisfied: "
+                    f"{_describe_blocking_acceptance_criteria(blocking_ac)}"
+                )
+            # Reject an internally-inconsistent review: a `pass` verdict cannot
+            # coexist with unresolved blocking findings or unsatisfied acceptance
+            # criteria. Surfacing the inconsistency explicitly stops a contradictory
+            # review from being read as evidence of completion.
+            if verdict == "pass" and (severe or blocking_ac):
+                reasons.append(
+                    "Latest review verdict is 'pass' but "
+                    f"{len(severe)} blocking finding(s) and {len(blocking_ac)} "
+                    "unsatisfied acceptance criteria remain (inconsistent review)"
                 )
 
         requires_adversarial = bool(

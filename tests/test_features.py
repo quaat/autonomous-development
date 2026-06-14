@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
@@ -257,33 +258,33 @@ class ReviewMergeTests(unittest.TestCase):
 
 
 class DeltaContradictionTests(unittest.TestCase):
-    def test_resolved_and_reintroduced_same_round_keeps_blocking(self) -> None:
+    def test_resolved_and_reintroduced_same_round_fails_closed(self) -> None:
+        # A delta that claims a finding is both resolved and simultaneously
+        # reintroduced (as a new finding or regression) is internally
+        # contradictory. The merge must refuse it rather than guess which side
+        # is authoritative, and the cumulative ledger must be left untouched.
         st: dict = {"cumulative_findings": []}
         controller.merge_full_review(
             st, {"findings": [{"id": "F-1", "severity": "high"}]}, 1
         )
-        # Contradictory delta: F-1 is both resolved and reintroduced as low.
-        controller.merge_delta_review(
-            st,
-            {
-                "resolved_findings": ["F-1"],
-                "new_findings": [{"id": "F-1", "severity": "low"}],
-                "regressions": [],
-            },
-            2,
-        )
-        # The original high finding must remain open and blocking.
-        severe = controller.cumulative_unresolved_severe(st)
-        self.assertEqual([f["id"] for f in severe], ["F-1"])
+        before = json.loads(json.dumps(st["cumulative_findings"]))
+        with self.assertRaises(state.StateError):
+            controller.merge_delta_review(
+                st,
+                {
+                    "resolved_findings": ["F-1"],
+                    "new_findings": [{"id": "F-1", "severity": "low"}],
+                    "regressions": [],
+                },
+                2,
+            )
+        # The original high finding must remain open and blocking, unchanged.
+        self.assertEqual(st["cumulative_findings"], before)
         index = {f["id"]: f for f in st["cumulative_findings"]}
         self.assertEqual(index["F-1"]["severity"], "high")
         self.assertEqual(index["F-1"]["status"], "open")
-        # The reintroduced report is remapped to a fresh canonical id with
-        # source_id pointing back at the model's reused id.
-        remapped = [f for f in st["cumulative_findings"] if f["id"] != "F-1"]
-        self.assertEqual(len(remapped), 1)
-        self.assertEqual(remapped[0]["source_id"], "F-1")
-        self.assertRegex(remapped[0]["id"], r"^F-\d+$")
+        severe = controller.cumulative_unresolved_severe(st)
+        self.assertEqual([f["id"] for f in severe], ["F-1"])
 
     def test_multiple_reused_ids_one_round_do_not_overwrite(self) -> None:
         # Two delta entries reusing the same id in one round must each get a
@@ -297,7 +298,7 @@ class DeltaContradictionTests(unittest.TestCase):
         controller.merge_delta_review(
             st,
             {
-                "resolved_findings": ["F-1"],
+                "resolved_findings": [],
                 "new_findings": [
                     {"id": "F-1", "severity": "critical"},
                     {"id": "F-1", "severity": "low"},

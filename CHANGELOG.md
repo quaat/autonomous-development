@@ -15,15 +15,21 @@
   `affected_acceptance_criteria` are merged into an id-keyed ledger keeping the
   latest `{id, status, evidence, round}` per criterion. Surfaced to the delta
   reviewer via a new `ACCEPTANCE CRITERIA (cumulative)` section in
-  `prompts/code-review-delta.md`. The completion gate does **not** yet block on
-  acceptance-criteria status — this only persists evidence that was previously
-  discarded (a gate condition is a possible follow-up)
+  `prompts/code-review-delta.md`
+- Per-round review checkpoints: each recorded review now stores a `checkpoint`
+  (head commit, branch, baseline, the feature `changed_paths`, and per-path content
+  fingerprints). Subsequent rounds compute the paths that changed since the previous
+  checkpoint and pass them to the delta reviewer via `CHANGED SINCE THE PREVIOUS
+  REVIEW`. An exact review-to-review patch is not reconstructed; the delta reviewer
+  reviews the full current diff against the baseline focusing on the changed paths
+  (`focused_full_fallback`), and the prompt states the exact patch is unavailable
+- Finding-resolution provenance: a resolved cumulative finding records
+  `resolved_at_round` and `resolution_source` (the resolving review round)
 - Delta-review prompt now lists each open finding with its full evidence (not just
   `id`/`severity`), so a prior finding can be resolved or carried from the prompt
   alone
 - Gate failure reasons now name the blocking findings (id, severity, category, and a
-  short description snippet) instead of only counting them; the block/pass decision
-  is unchanged
+  short description snippet) instead of only counting them
 - Token instrumentation: `codex` phases run with `codex exec --json`, retain the NDJSON
   event stream (`*.events.ndjson`), and record a per-phase usage block
   (`prompt_characters`, `output_characters`, `duration_seconds`, `model`,
@@ -51,6 +57,18 @@
 - `skills/autonomous-feature/references/`: per-phase guidance loaded only when needed
 
 ### Changed
+- Completion gate now enforces review consistency (fail closed). Every cumulative
+  acceptance criterion must be `satisfied` — `not_satisfied`, `partially_satisfied`
+  and `not_verifiable` all block completion — and a review `verdict: pass` that
+  coexists with unresolved blocking findings or unsatisfied acceptance criteria is
+  rejected as internally inconsistent
+- Delta resolution claims fail closed: `resolved_findings` is now validated when
+  merging a delta review. An unknown id (not in the cumulative ledger), a duplicate
+  id within the same round, or an id also reported as a new finding/regression that
+  round raises instead of being silently dropped. `schemas/review-delta.schema.json`
+  adds `uniqueItems: true` on `resolved_findings`
+- Triage history rendering includes the cumulative `finding_id` when present so a
+  rejected/resolved disposition is traceable to the finding it dispositioned
 - Codex context is compacted: repository manifest (instructions/build manifests/primary
   modules/test roots/CI) instead of the first 250 tracked file names; latest-only
   verification checks; finding ledger instead of full prior review/triage prose
@@ -61,6 +79,12 @@
   the same source is an idempotent no-op, any other occupant fails the command, and
   `--force` no longer authorizes overwrite (it cannot bypass run immutability). Use the new
   `--target-run-id` to migrate into a fresh, unused run id instead.
+- A failed `codex exec` no longer mutates a run that became terminal while Codex ran. The
+  failure handler stages its error log under an invocation-unique name, then re-validates run
+  identity and exact-active status under the lock before publishing the canonical log or
+  appending a note. If a concurrent cancel/block drove the run terminal, the staged log is
+  discarded and the command reports both the Codex failure and the status change without
+  touching the run.
 
 ### Known limitations
 - `accept` artifact publication is exception-safe (it rolls back staged/backup files on a

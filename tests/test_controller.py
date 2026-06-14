@@ -849,6 +849,64 @@ class ControllerTests(unittest.TestCase):
         state = json.loads(state_path.read_text(encoding="utf-8"))
         self.assertNotEqual(state.get("status"), "complete")
 
+    def test_review_checkpoint_captures_and_detects_changes(self) -> None:
+        """A review checkpoint snapshots the worktree it saw; a later round
+        detects which feature paths changed since that checkpoint."""
+        repo = self.make_repo()
+        repo_info = resolve_repository(repo)
+        baseline = repo_info.head_commit
+        state: dict = {"reviews": [], "baseline": {"commit": baseline}}
+        # Introduce a feature change relative to the baseline commit.
+        (repo / "feature.py").write_text("v1\n", encoding="utf-8")
+        checkpoint = controller.capture_review_checkpoint(
+            repo_info, state, checkpoint_id="review-01"
+        )
+        self.assertIn("feature.py", checkpoint["changed_paths"])
+        self.assertEqual(checkpoint["review_context_mode"], controller.REVIEW_CONTEXT_MODE)
+        self.assertIsNone(checkpoint["previous_checkpoint_id"])
+        # No prior checkpoint yet → "treat as full review".
+        self.assertIsNone(controller.changed_paths_since_last_review(repo_info, state))
+        state["reviews"].append({"round": 1, "checkpoint": checkpoint})
+        # Edit the same file; the next round must see it as changed.
+        (repo / "feature.py").write_text("v2 changed\n", encoding="utf-8")
+        changed = controller.changed_paths_since_last_review(repo_info, state)
+        self.assertEqual(changed, ["feature.py"])
+
+    def test_evaluate_blocks_on_unsatisfied_acceptance_criterion(self) -> None:
+        """The completion gate fails closed on an acceptance criterion that is not
+        `satisfied`, and rejects a `pass` verdict that coexists with it."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.run_controller(repo, "init", "--feature", "F", state_home=state_home)
+        state_path = self._find_state_path(repo, state_home)
+        run_dir = state_path.parent
+        # Satisfy every gate condition EXCEPT the acceptance criteria.
+        (run_dir / "accepted-spec.md").write_text("spec\n", encoding="utf-8")
+        (run_dir / "accepted-plan.md").write_text("plan\n", encoding="utf-8")
+        (run_dir / "review-01.codex.json").write_text(
+            json.dumps({"verdict": "pass", "summary": "ok"}), encoding="utf-8"
+        )
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["verification"] = {
+            "checks": [{"name": "unit", "command": ["true"], "exit_code": 0}]
+        }
+        state["reviews"] = [
+            {"round": 1, "verdict": "pass", "delta": False, "path": "review-01.codex.json"}
+        ]
+        state["cumulative_findings"] = []
+        state["cumulative_acceptance_criteria"] = [
+            {"id": "AC-1", "status": "not_satisfied", "evidence": "incomplete", "round": 1}
+        ]
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        result = self.run_controller(repo, "evaluate", state_home=state_home)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("acceptance criteria not satisfied", result.stderr)
+        self.assertIn("AC-1", result.stderr)
+        self.assertIn("inconsistent review", result.stderr)
+        after = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertNotEqual(after.get("status"), "complete")
+
     def test_usage_report_works_after_run_is_terminal(self) -> None:
         """The usage report (FR-1) must remain viewable after the run reaches a
         terminal status, without requiring an explicit --run-id."""
@@ -1009,6 +1067,11 @@ class ControllerTests(unittest.TestCase):
         captured: list[list[str]] = []
 
         def fake_run_process(cmd, *, cwd, input_text=None, check=False, timeout=None):
+            # The review-merge path captures a git checkpoint; let real git run.
+            if cmd and cmd[0] == "git":
+                return original(
+                    cmd, cwd=cwd, input_text=input_text, check=check, timeout=timeout
+                )
             captured.append(list(cmd))
             # Emulate codex writing the output-last-message file.
             out_path = Path(cmd[cmd.index("--output-last-message") + 1])
@@ -1176,6 +1239,10 @@ class ControllerTests(unittest.TestCase):
         captured: list[list[str]] = []
 
         def fake_run_process(cmd, *, cwd, input_text=None, check=False, timeout=None):
+            if cmd and cmd[0] == "git":
+                return original(
+                    cmd, cwd=cwd, input_text=input_text, check=check, timeout=timeout
+                )
             captured.append(list(cmd))
             out_path = Path(cmd[cmd.index("--output-last-message") + 1])
             payload = {
@@ -2059,6 +2126,69 @@ class TerminalStateIntegrityTests(unittest.TestCase):
         # The run equals exactly the cancellation; exhaustion wrote nothing.
         self.assertEqual(state_path.read_bytes(), cancelled_bytes)
 
+    def test_failed_codex_does_not_mutate_concurrently_cancelled_run(self) -> None:
+        """A non-zero `codex exec` writes a phase error log and appends a note
+        under the lock. If a concurrent cancel makes the run terminal while Codex
+        ran, the failure handler must re-check status under the lock and leave the
+        run byte-identical (no resurrected note, no published canonical log)."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_dir = state_path.parent
+
+        s = json.loads(state_path.read_text(encoding="utf-8"))
+        s["status"] = "active"
+        s["phase"] = "review"
+        s["review_round"] = 0
+        s["max_review_rounds"] = 3
+        s["verification"] = {
+            "checks": [{"name": "t", "command": ["true"], "exit_code": 0}]
+        }
+        state_path.write_text(json.dumps(s), encoding="utf-8")
+        (run_dir / "accepted-spec.md").write_text("SPEC\n", encoding="utf-8")
+        (run_dir / "accepted-plan.md").write_text("PLAN\n", encoding="utf-8")
+
+        cancelled = json.loads(state_path.read_text(encoding="utf-8"))
+        cancelled["status"] = "cancelled"
+        cancelled["phase"] = "cancelled"
+        cancelled_bytes = json.dumps(cancelled).encode("utf-8")
+
+        def fake_run_process(cmd, *, cwd, input_text=None, check=False, timeout=None):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+
+        original_lock = controller.RunStateLock
+
+        class FlipLock(original_lock):  # type: ignore[valid-type,misc]
+            def __enter__(self_inner):  # noqa: N805
+                entered = super().__enter__()
+                state_path.write_bytes(cancelled_bytes)
+                return entered
+
+        original = controller.run_process
+        controller.run_process = fake_run_process
+        controller.RunStateLock = FlipLock
+        try:
+            args = argparse.Namespace(
+                project_root=str(repo),
+                state_dir=str(state_home),
+                run_id=None,
+                phase="review",
+                timeout=None,
+            )
+            with self.assertRaises(controller.WorkflowError) as ctx:
+                controller.cmd_codex(args)
+        finally:
+            controller.run_process = original
+            controller.RunStateLock = original_lock
+
+        msg = str(ctx.exception).lower()
+        self.assertIn("no longer active", msg)
+        # The run is byte-identical to the cancellation: no note was appended.
+        self.assertEqual(state_path.read_bytes(), cancelled_bytes)
+        # The canonical error log was not published, and no staging log leaked.
+        self.assertFalse((run_dir / "review.codex.stderr.log").exists())
+        self.assertFalse(list(run_dir.glob(".staging-*")))
+
     # --- lifecycle-transition identity invariants (cancel/block/archive-run) ---
 
     # cancel/block require an active source; archive-run requires a terminal one.
@@ -2541,6 +2671,53 @@ class EvidencePreservingReviewTests(unittest.TestCase):
         self.assertIn("F-2", described)
         # block/pass detection itself is unchanged: both are still severe+open.
         self.assertEqual(len(severe), 2)
+
+    def test_valid_resolution_records_round_and_source(self) -> None:
+        state: dict = {"cumulative_findings": []}
+        controller.merge_full_review(state, {"findings": [self._finding("F-1")]}, 1)
+        controller.merge_delta_review(
+            state, {"resolved_findings": ["F-1"], "new_findings": []}, 2
+        )
+        entry = {f["id"]: f for f in state["cumulative_findings"]}["F-1"]
+        self.assertEqual(entry["status"], "resolved")
+        self.assertEqual(entry["resolved_at_round"], 2)
+        self.assertEqual(entry["resolution_source"], "review-02")
+
+    def test_resolving_unknown_finding_fails_closed(self) -> None:
+        state: dict = {"cumulative_findings": []}
+        controller.merge_full_review(state, {"findings": [self._finding("F-1")]}, 1)
+        with self.assertRaises(controller.WorkflowError):
+            controller.merge_delta_review(
+                state, {"resolved_findings": ["F-9"], "new_findings": []}, 2
+            )
+        # The ledger is untouched: F-1 is still open and blocking.
+        entry = {f["id"]: f for f in state["cumulative_findings"]}["F-1"]
+        self.assertEqual(entry["status"], "open")
+
+    def test_resolving_same_finding_twice_fails_closed(self) -> None:
+        state: dict = {"cumulative_findings": []}
+        controller.merge_full_review(state, {"findings": [self._finding("F-1")]}, 1)
+        with self.assertRaises(controller.WorkflowError):
+            controller.merge_delta_review(
+                state,
+                {"resolved_findings": ["F-1", "F-1"], "new_findings": []},
+                2,
+            )
+
+    def test_blocking_acceptance_criteria_flags_all_unsatisfied(self) -> None:
+        # Only `satisfied` is non-blocking (fail closed): not_satisfied,
+        # partially_satisfied and not_verifiable all block completion.
+        state: dict = {
+            "cumulative_acceptance_criteria": [
+                {"id": "AC-1", "status": "satisfied"},
+                {"id": "AC-2", "status": "partially_satisfied"},
+                {"id": "AC-3", "status": "not_satisfied"},
+                {"id": "AC-4", "status": "not_verifiable"},
+            ]
+        }
+        blocking = controller.blocking_acceptance_criteria(state)
+        blocked_ids = {c["id"] for c in blocking}
+        self.assertEqual(blocked_ids, {"AC-2", "AC-3", "AC-4"})
 
 
 if __name__ == "__main__":
