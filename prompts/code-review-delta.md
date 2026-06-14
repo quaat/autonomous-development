@@ -20,8 +20,11 @@ RECORDED VERIFICATION (latest logical checks)
 FINDING LEDGER (fingerprints from prior triage)
 {{FINDING_LEDGER}}
 
-OPEN FINDINGS (still-blocking findings; reference these `F-<n>` ids in `resolved_findings` when fixed)
+OPEN FINDINGS (still-blocking findings with full evidence; reference these `F-<n>` ids in `resolved_findings` when fixed)
 {{OPEN_FINDINGS}}
+
+ACCEPTANCE CRITERIA (cumulative status across all rounds)
+{{ACCEPTANCE_CRITERIA}}
 
 Rules:
 - Report only changes since the previous round: resolved findings, genuinely new findings, and regressions.

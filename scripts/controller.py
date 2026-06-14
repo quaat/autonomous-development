@@ -31,6 +31,8 @@ from state import (
     RunStateLock,
     RepoInitLock,
     migrate_v1_to_v2,
+    validate_run_id,
+    validate_state,
     load_run_state,
     save_run_state,
     load_repo_metadata,
@@ -42,6 +44,7 @@ from state import (
     resolve_run_for_active_mutation,
     resolve_run_for_transition,
     require_active_run_state,
+    verify_loaded_run_identity,
     assert_transition_allowed,
     detect_drift,
     repository_context,
@@ -324,6 +327,7 @@ def prompt_values(run_dir: Path, state: dict[str, Any]) -> dict[str, str]:
         "LATEST_REVIEW": finding_ledger,
         "FINDING_LEDGER": finding_ledger,
         "OPEN_FINDINGS": render_open_findings(state),
+        "ACCEPTANCE_CRITERIA": render_acceptance_criteria(state),
     }
 
 
@@ -551,8 +555,10 @@ def render_open_findings(state: dict[str, Any]) -> str:
     Delta reviews must reference prior findings by `F-<n>` id in
     `resolved_findings`, but the triage ledger is keyed by fingerprint. Without
     the ids the reviewer cannot reliably resolve a prior finding, so a severe
-    finding could remain open indefinitely. Surface the open findings (id +
-    severity + status) so the delta reviewer can close them deterministically.
+    finding could remain open indefinitely. Surface each open finding with its
+    full evidence (file/line/description/evidence/recommended fix) so the delta
+    reviewer can resolve or carry it from the prompt alone, without re-opening
+    the raw review-NN.codex.json.
     """
     open_findings = [
         {
@@ -561,6 +567,12 @@ def render_open_findings(state: dict[str, Any]) -> str:
             "category": f.get("category"),
             "status": f.get("status"),
             "round": f.get("round"),
+            "origin": f.get("origin"),
+            "file": f.get("file"),
+            "line_start": f.get("line_start"),
+            "description": f.get("description"),
+            "evidence": f.get("evidence"),
+            "recommended_fix": f.get("recommended_fix"),
         }
         for f in state.get("cumulative_findings", [])
         if isinstance(f, dict) and f.get("status") == "open"
@@ -568,6 +580,30 @@ def render_open_findings(state: dict[str, Any]) -> str:
     if not open_findings:
         return "(none)"
     return json.dumps(open_findings, indent=2)
+
+
+def render_acceptance_criteria(state: dict[str, Any]) -> str:
+    """Render the cumulative acceptance-criteria ledger for the delta reviewer.
+
+    A delta review only reports the criteria it touched
+    (`affected_acceptance_criteria`). Surfacing the cumulative status of every
+    criterion lets the reviewer judge the change against the full set without
+    re-reading the round-1 full review.
+    """
+    ledger = state.get("cumulative_acceptance_criteria", [])
+    items = [
+        {
+            "id": c.get("id"),
+            "status": c.get("status"),
+            "evidence": c.get("evidence"),
+            "round": c.get("round"),
+        }
+        for c in ledger
+        if isinstance(c, dict) and c.get("id")
+    ]
+    if not items:
+        return "(none)"
+    return json.dumps(items, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +684,70 @@ def migrate_cumulative_finding_ids(state: dict[str, Any]) -> None:
         f["id"] = f"F-{max_n}"
 
 
+# The evidence fields every cumulative finding preserves verbatim from the
+# validated Codex review payload, so the ledger is self-contained: the gate
+# report, the audit trail, and the delta reviewer never need to re-open the raw
+# review-NN.codex.json. Stored inline because run-state is the single source of
+# truth the (future) run-state schema will freeze.
+_FINDING_EVIDENCE_DEFAULTS: dict[str, Any] = {
+    "file": None,
+    "line_start": None,
+    "description": "",
+    "evidence": "",
+    "recommended_fix": "",
+}
+
+
+def _cumulative_finding(
+    finding: dict[str, Any],
+    *,
+    fid: str,
+    status: str,
+    round_num: int,
+    origin: str,
+    source_id: str | None = None,
+) -> dict[str, Any]:
+    """Build a canonical cumulative finding, preserving evidence inline.
+
+    `finding` is an already schema-validated review finding, so the evidence
+    fields are present; `.get` with defaults keeps this robust if called on a
+    sparser dict. `origin` records provenance (full | delta | regression) and
+    `source_id` is set only when a colliding id was remapped to a fresh one.
+    """
+    entry: dict[str, Any] = {
+        "id": fid,
+        "severity": finding.get("severity"),
+        "category": finding.get("category"),
+        "status": status,
+        "round": round_num,
+        "origin": origin,
+    }
+    for key, default in _FINDING_EVIDENCE_DEFAULTS.items():
+        entry[key] = finding.get(key, default)
+    if source_id is not None:
+        entry["source_id"] = source_id
+    return entry
+
+
+def _finalize_cumulative(
+    index: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Normalize every cumulative finding to the canonical key set.
+
+    Carried-forward and legacy entries (recorded before evidence was preserved)
+    are backfilled with evidence defaults and an `origin` of "legacy" so the
+    whole ledger has one uniform shape. Idempotent: an already-canonical entry is
+    unchanged. Run at every site that rebuilds `cumulative_findings`.
+    """
+    for entry in index.values():
+        if not isinstance(entry, dict):
+            continue
+        entry.setdefault("origin", "legacy")
+        for key, default in _FINDING_EVIDENCE_DEFAULTS.items():
+            entry.setdefault(key, default)
+    return list(index.values())
+
+
 def _require_finding_items(items: list[Any], context: str) -> None:
     """Fail closed if any review finding item is malformed.
 
@@ -683,23 +783,23 @@ def merge_full_review(state: dict[str, Any], parsed: dict[str, Any], round_num: 
         # original id under `source_id`.
         if fid in index:
             new_id = allocate()
-            index[new_id] = {
-                "id": new_id,
-                "severity": finding.get("severity"),
-                "category": finding.get("category"),
-                "status": "open",
-                "round": round_num,
-                "source_id": fid,
-            }
+            index[new_id] = _cumulative_finding(
+                finding,
+                fid=new_id,
+                status="open",
+                round_num=round_num,
+                origin="full",
+                source_id=fid,
+            )
             continue
-        index[fid] = {
-            "id": fid,
-            "severity": finding.get("severity"),
-            "category": finding.get("category"),
-            "status": "open",
-            "round": round_num,
-        }
-    state["cumulative_findings"] = list(index.values())
+        index[fid] = _cumulative_finding(
+            finding,
+            fid=fid,
+            status="open",
+            round_num=round_num,
+            origin="full",
+        )
+    state["cumulative_findings"] = _finalize_cumulative(index)
 
 
 def merge_delta_review(
@@ -708,12 +808,12 @@ def merge_delta_review(
     """Merge a round-2+ delta review into the cumulative finding set."""
     migrate_cumulative_finding_ids(state)
     index = _index_findings(state)
-    new_items = list(parsed.get("new_findings", [])) + list(
-        parsed.get("regressions", [])
-    )
+    new_findings = list(parsed.get("new_findings", []))
+    regressions = list(parsed.get("regressions", []))
     # Fail closed on malformed nested items rather than dropping them silently.
-    _require_finding_items(new_items, "new_findings/regressions")
-    reintroduced_ids = {f["id"] for f in new_items}
+    _require_finding_items(new_findings, "new_findings")
+    _require_finding_items(regressions, "regressions")
+    reintroduced_ids = {f["id"] for f in new_findings} | {f["id"] for f in regressions}
     for fid in parsed.get("resolved_findings", []):
         # Fail closed: an id cannot be both resolved and (re)reported as a new
         # finding/regression in the same round. Leaving the original untouched
@@ -721,32 +821,40 @@ def merge_delta_review(
         # delta flip it to a lower-severity reintroduction and unblock the gate.
         if fid in index and fid not in reintroduced_ids:
             index[fid]["status"] = "resolved"
-    allocate = _canonical_id_allocator(index, [str(f["id"]) for f in new_items])
-    for finding in new_items:
-        existing = index.get(finding["id"])
-        # Never let a delta overwrite an existing finding (any status): doing so
-        # could downgrade or drop an unresolved critical/high. Preserve the
-        # original and remap the colliding report to a fresh canonical id so it
-        # stays referenceable by triage, recording the model's id as `source_id`.
-        if existing is not None:
-            new_id = allocate()
-            index[new_id] = {
-                "id": new_id,
-                "severity": finding.get("severity"),
-                "category": finding.get("category"),
-                "status": "open",
-                "round": round_num,
-                "source_id": finding["id"],
-            }
-            continue
-        index[finding["id"]] = {
-            "id": finding["id"],
-            "severity": finding.get("severity"),
-            "category": finding.get("category"),
-            "status": "open",
-            "round": round_num,
-        }
-    state["cumulative_findings"] = list(index.values())
+    incoming_ids = [str(f["id"]) for f in new_findings] + [
+        str(f["id"]) for f in regressions
+    ]
+    allocate = _canonical_id_allocator(index, incoming_ids)
+    # Iterate new findings and regressions separately so provenance is preserved
+    # in `origin` ("delta" vs "regression").
+    for origin, items in (("delta", new_findings), ("regression", regressions)):
+        for finding in items:
+            fid = finding["id"]
+            existing = index.get(fid)
+            # Never let a delta overwrite an existing finding (any status): doing
+            # so could downgrade or drop an unresolved critical/high. Preserve the
+            # original and remap the colliding report to a fresh canonical id so
+            # it stays referenceable by triage, recording the model's id as
+            # `source_id`.
+            if existing is not None:
+                new_id = allocate()
+                index[new_id] = _cumulative_finding(
+                    finding,
+                    fid=new_id,
+                    status="open",
+                    round_num=round_num,
+                    origin=origin,
+                    source_id=fid,
+                )
+                continue
+            index[fid] = _cumulative_finding(
+                finding,
+                fid=fid,
+                status="open",
+                round_num=round_num,
+                origin=origin,
+            )
+    state["cumulative_findings"] = _finalize_cumulative(index)
 
 
 # Triage dispositions that release a finding from blocking completion. A finding
@@ -810,7 +918,48 @@ def apply_triage_to_cumulative(
         if severe and not _triage_rationale(entry):
             continue
         finding["status"] = status
-    state["cumulative_findings"] = list(index.values())
+    state["cumulative_findings"] = _finalize_cumulative(index)
+
+
+def merge_acceptance_criteria(
+    state: dict[str, Any], parsed: dict[str, Any], round_num: int
+) -> None:
+    """Merge a review's acceptance-criteria assessment into a cumulative ledger.
+
+    Full reviews carry the complete assessment under
+    `acceptance_criteria_assessment`; delta reviews carry only the criteria they
+    touched under `affected_acceptance_criteria`. Both item shapes are
+    `{id, status, evidence}`. The ledger keeps the latest disposition per id (with
+    the round it was last updated) so the audit trail and the delta reviewer have
+    the full criterion set, not just the most recent round's slice.
+
+    Gate semantics are unchanged: the completion gate does not (yet) block on AC
+    status; this only persists evidence that was previously discarded.
+    """
+    items = parsed.get("acceptance_criteria_assessment")
+    if not isinstance(items, list):
+        items = parsed.get("affected_acceptance_criteria", [])
+    if not isinstance(items, list):
+        return
+    ledger = state.get("cumulative_acceptance_criteria")
+    if not isinstance(ledger, list):
+        ledger = []
+    index: dict[str, dict[str, Any]] = {
+        c["id"]: c for c in ledger if isinstance(c, dict) and c.get("id")
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        cid = item.get("id")
+        if not isinstance(cid, str) or not cid.strip():
+            continue
+        index[cid] = {
+            "id": cid,
+            "status": item.get("status"),
+            "evidence": item.get("evidence", ""),
+            "round": round_num,
+        }
+    state["cumulative_acceptance_criteria"] = list(index.values())
 
 
 # Severities the schemas treat as non-blocking. Anything else on an open
@@ -838,6 +987,39 @@ def cumulative_unresolved_severe(state: dict[str, Any]) -> list[dict[str, Any]]:
         if is_severe and not released:
             severe.append(f)
     return severe
+
+
+def _describe_blocking_findings(
+    severe: list[dict[str, Any]], *, limit: int = 5, snippet: int = 80
+) -> str:
+    """Summarize the blocking findings for the gate failure reason.
+
+    The cumulative ledger now stores evidence inline, so the gate can name the
+    findings (id / severity / category + a short description snippet) instead of
+    only counting them. Pure reporting; the block/pass decision is unchanged.
+    """
+    parts: list[str] = []
+    for f in severe[:limit]:
+        if not isinstance(f, dict):
+            parts.append("(malformed)")
+            continue
+        fid = f.get("id", "(no id)")
+        severity = f.get("severity", "(no severity)")
+        category = f.get("category")
+        label = f"{fid} [{severity}"
+        if category:
+            label += f"/{category}"
+        label += "]"
+        description = f.get("description")
+        if isinstance(description, str) and description.strip():
+            text = description.strip()
+            if len(text) > snippet:
+                text = text[: snippet - 1].rstrip() + "…"
+            label += f" {text}"
+        parts.append(label)
+    if len(severe) > limit:
+        parts.append(f"(+{len(severe) - limit} more)")
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1038,6 +1220,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 "reviews": [],
                 "adversarial_reviews": [],
                 "cumulative_findings": [],
+                "cumulative_acceptance_criteria": [],
                 "review_ledger": [],
                 "codex_runs": [],
                 "risk": {
@@ -1116,13 +1299,36 @@ def cmd_codex(args: argparse.Namespace) -> int:
         if next_round > maximum:
             with RunStateLock(run_dir):
                 fresh = load_run_state(run_dir)
+                verify_loaded_run_identity(
+                    fresh, run_dir=run_dir, expected_repo_id=repo.id
+                )
+                # The exhaustion decision was made from a pre-lock snapshot. A
+                # concurrent cancel/block may have made the run terminal in the
+                # meantime; flipping it to "blocked" now would overwrite that
+                # terminal decision (terminal-to-terminal) and rewrite the user's
+                # cancellation. Require an exactly-active run before recording
+                # exhaustion so the concurrent decision sticks.
+                require_active_run_state(
+                    fresh, run_ref.run_id, "mark review budget exhausted"
+                )
+                # Recompute from the fresh state: a concurrent invocation may have
+                # changed review_round/max_review_rounds. If it is no longer
+                # exhausted, do not block on the stale pre-lock decision — signal a
+                # retryable state change instead.
+                fresh_round = int(fresh.get("review_round", 0)) + 1
+                fresh_max = int(fresh.get("max_review_rounds", 3))
+                if fresh_round <= fresh_max:
+                    raise WorkflowError(
+                        "Review budget changed concurrently (now round "
+                        f"{fresh_round} of {fresh_max}); retry the review."
+                    )
                 fresh["status"] = "blocked"
                 fresh["phase"] = "review-budget-exhausted"
                 fresh.setdefault("notes", []).append(
-                    f"Maximum review rounds exhausted ({maximum})"
+                    f"Maximum review rounds exhausted ({fresh_max})"
                 )
                 save_run_state(run_dir, fresh)
-            raise WorkflowError(f"Maximum review rounds exhausted ({maximum})")
+            raise WorkflowError(f"Maximum review rounds exhausted ({fresh_max})")
         # Round 1 is a full review; rounds 2+ use the compact delta schema/prompt.
         # A delta review only carries forward findings relative to a recorded
         # full-review baseline (which seeds cumulative_findings). If no full
@@ -1258,6 +1464,9 @@ def cmd_codex(args: argparse.Namespace) -> int:
         final_path = output_path
         with RunStateLock(run_dir):
             state = load_run_state(run_dir)
+            verify_loaded_run_identity(
+                state, run_dir=run_dir, expected_repo_id=repo.id
+            )
             # Status was checked before the (long) Codex execution. A concurrent
             # `cancel`/`block` may have driven the run to a terminal state while
             # Codex ran; merging now would append reviews/findings and reset the
@@ -1354,6 +1563,7 @@ def cmd_codex(args: argparse.Namespace) -> int:
                     merge_delta_review(state, parsed, next_round)
                 else:
                     merge_full_review(state, parsed, next_round)
+                merge_acceptance_criteria(state, parsed, next_round)
             elif phase == "adversarial":
                 state["phase"] = "adversarially-reviewed"
                 state.setdefault("adversarial_reviews", []).append(
@@ -1786,6 +1996,9 @@ def cmd_accept(args: argparse.Namespace) -> int:
     try:
         with RunStateLock(run_dir):
             state = load_run_state(run_dir)
+            verify_loaded_run_identity(
+                state, run_dir=run_dir, expected_repo_id=repo.id
+            )
             require_active_run_state(state, run_id, "accept")
             # Publish all artifacts and the state as one all-or-nothing unit. Each
             # canonical file that already exists is moved to an invocation-unique
@@ -1881,6 +2094,7 @@ def cmd_run_check(args: argparse.Namespace) -> int:
     # Acquire lock to compute a collision-free index and persist atomically.
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         # TOCTOU guard: a `cancel`/`block` may have driven the run terminal while
         # this (possibly long) check ran. Publishing now would resurrect it.
         require_active_run_state(state, run_id, "run-check")
@@ -1957,6 +2171,7 @@ def cmd_set_phase(args: argparse.Namespace) -> int:
     run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         require_active_run_state(state, run_ref.run_id, "set-phase")
         require_no_unsafe_drift(state, repo)
         state["phase"] = args.phase
@@ -1981,6 +2196,7 @@ def cmd_set_risk(args: argparse.Namespace) -> int:
     run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         require_active_run_state(state, run_ref.run_id, "set-risk")
         require_no_unsafe_drift(state, repo)
         risk = state.setdefault("risk", {})
@@ -2026,6 +2242,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
     reasons: list[str] = []
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         # A concurrent cancel/block may have made the run terminal after
         # resolution; evaluate must never flip a terminal run to complete/active.
         require_active_run_state(state, run_id, "evaluate")
@@ -2077,7 +2294,8 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 severe = unresolved_severe_findings(review)
             if severe:
                 reasons.append(
-                    f"{len(severe)} unresolved critical/high finding(s) in review ledger"
+                    f"{len(severe)} unresolved critical/high finding(s) in "
+                    f"review ledger: {_describe_blocking_findings(severe)}"
                 )
 
         requires_adversarial = bool(
@@ -2198,6 +2416,7 @@ def cmd_cancel(args: argparse.Namespace) -> int:
     run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         assert_transition_allowed(state.get("status"), "cancel", run_ref.run_id)
         require_no_unsafe_drift(state, repo)
         state["status"] = "cancelled"
@@ -2222,6 +2441,7 @@ def cmd_block(args: argparse.Namespace) -> int:
     run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         assert_transition_allowed(state.get("status"), "block", run_ref.run_id)
         require_no_unsafe_drift(state, repo)
         state["status"] = "blocked"
@@ -2321,64 +2541,116 @@ def cmd_migrate_legacy_state(args: argparse.Namespace) -> int:
     if not isinstance(legacy_state, dict):
         raise WorkflowError("Legacy state must be a JSON object.")
 
-    # Determine run_id for the new layout
-    legacy_run_id = legacy_state.get("run_id") or new_run_id()
-    new_run_dir = run_dir_path(state_home, repo.id, legacy_run_id)
+    # Choose the destination run ID. An explicit --target-run-id allows an
+    # intentional migration to a fresh, unused ID without colliding with the
+    # legacy run's own ID; otherwise reuse the legacy run_id (or mint one when
+    # the legacy state has none).
+    target_run_id = getattr(args, "target_run_id", None) or legacy_state.get(
+        "run_id"
+    ) or new_run_id()
+    try:
+        validate_run_id(target_run_id)
+    except StateError as exc:
+        raise WorkflowError(str(exc)) from exc
 
-    # Idempotency check
-    existing_state_path = new_run_dir / "run-state.json"
-    if existing_state_path.exists() and not getattr(args, "force", False):
-        try:
-            existing = json.loads(existing_state_path.read_text(encoding="utf-8"))
-            if existing.get("run_id") == legacy_run_id and existing.get(
-                "migrated_from"
+    # Everything below — the target-existence check, staging, atomic publication,
+    # and metadata update — runs as one critical section so a concurrent init or
+    # migration for this repository cannot interleave with publication.
+    with RepoInitLock(state_home, repo.id):
+        new_run_dir = run_dir_path(state_home, repo.id, target_run_id)
+        legacy_source = str(legacy_dir)
+
+        existing_state_path = new_run_dir / "run-state.json"
+        if new_run_dir.exists():
+            # The only non-error outcome for an existing target is an idempotent
+            # re-run of the *same* legacy source. Any other occupant — an active
+            # run, a terminal run, or a migration from a different source — is
+            # immutable here and must never be overwritten (not even with
+            # --force).
+            existing: dict | None = None
+            if existing_state_path.exists():
+                try:
+                    loaded = json.loads(
+                        existing_state_path.read_text(encoding="utf-8")
+                    )
+                    if isinstance(loaded, dict):
+                        existing = loaded
+                except (OSError, json.JSONDecodeError):
+                    existing = None
+            if (
+                existing is not None
+                and existing.get("run_id") == target_run_id
+                and existing.get("migrated_from") == legacy_source
             ):
                 print(
-                    f"Already migrated: run {legacy_run_id!r} exists at {new_run_dir}"
+                    f"Already migrated: run {target_run_id!r} exists at {new_run_dir}"
                 )
                 return 0
-        except (OSError, json.JSONDecodeError):
-            pass
-        raise WorkflowError(
-            f"Run directory already exists: {new_run_dir}. " "Use --force to overwrite."
+            raise WorkflowError(
+                f"Run directory already exists and will not be overwritten: "
+                f"{new_run_dir}. Migrating here would destroy an existing run. "
+                "Re-run with --target-run-id <new-unused-id> to migrate into a "
+                "fresh run instead."
+            )
+
+        # Build the migrated run in a temporary sibling directory and publish it
+        # by an atomic rename only after conversion and validation succeed. A
+        # failure at any earlier step leaves only the temp dir, which we remove,
+        # so a partially built run is never visible at the canonical path.
+        runs_base = new_run_dir.parent
+        runs_base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        staging_dir = runs_base / f".migrate-{uuid.uuid4().hex}.tmp"
+        try:
+            staging_dir.mkdir(mode=0o700)
+            for src in legacy_dir.iterdir():
+                if src.is_file():
+                    shutil.copy2(str(src), str(staging_dir / src.name))
+                elif src.is_dir():
+                    shutil.copytree(str(src), str(staging_dir / src.name))
+
+            migrated = migrate_v1_to_v2(
+                legacy_state, staging_dir, repo, legacy_dir=legacy_dir
+            )
+            migrated["run_id"] = target_run_id
+            migrated["migrated_from"] = legacy_source
+            migrated["migrated_at"] = utc_now()
+            validate_state(migrated)
+            save_run_state(staging_dir, migrated)
+
+            # Re-check existence under the lock right before publishing. The lock
+            # already excludes concurrent writers, so this only guards against a
+            # stray pre-existing directory; never overwrite it.
+            if new_run_dir.exists():
+                raise WorkflowError(
+                    f"Run directory appeared during migration: {new_run_dir}. "
+                    "Aborting without overwriting it."
+                )
+            os.rename(str(staging_dir), str(new_run_dir))
+        except BaseException:
+            shutil.rmtree(str(staging_dir), ignore_errors=True)
+            raise
+
+        # Confirm the published run validates and is correctly attributed before
+        # recording it in repository metadata.
+        published = load_run_state(new_run_dir)
+        verify_loaded_run_identity(
+            published, run_dir=new_run_dir, expected_repo_id=repo.id
         )
 
-    new_run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-    # Copy all files from legacy dir preserving metadata
-    for src in legacy_dir.iterdir():
-        if src.is_file():
-            dst = new_run_dir / src.name
-            shutil.copy2(str(src), str(dst))
-        elif src.is_dir():
-            dst_dir = new_run_dir / src.name
-            if dst_dir.exists() and getattr(args, "force", False):
-                shutil.rmtree(str(dst_dir))
-            shutil.copytree(str(src), str(dst_dir))
-
-    # Convert to v2 format; pass legacy_dir so absolute paths under it are correctly relativized.
-    migrated = migrate_v1_to_v2(legacy_state, new_run_dir, repo, legacy_dir=legacy_dir)
-    migrated["run_id"] = legacy_run_id
-    migrated["migrated_from"] = str(legacy_dir)
-    migrated["migrated_at"] = utc_now()
-
-    save_run_state(new_run_dir, migrated)
-
-    # Save repo metadata
-    meta = load_repo_metadata(state_home, repo.id)
-    meta.update(
-        {
-            "id": repo.id,
-            "display_name": repo.display_name,
-            "canonical_root": str(repo.canonical_root),
-            "remote_display": repo.remote_display,
-            "last_run_id": legacy_run_id,
-        }
-    )
-    save_repo_metadata(state_home, repo.id, meta)
+        meta = load_repo_metadata(state_home, repo.id)
+        meta.update(
+            {
+                "id": repo.id,
+                "display_name": repo.display_name,
+                "canonical_root": str(repo.canonical_root),
+                "remote_display": repo.remote_display,
+                "last_run_id": target_run_id,
+            }
+        )
+        save_repo_metadata(state_home, repo.id, meta)
 
     print(f"Migrated legacy state from {legacy_dir} to {new_run_dir}")
-    print(f"Run ID: {legacy_run_id}")
+    print(f"Run ID: {target_run_id}")
     print("The original legacy directory has NOT been modified.")
     return 0
 
@@ -2397,6 +2669,7 @@ def cmd_archive_run(args: argparse.Namespace) -> int:
     run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         # Idempotent: re-archiving an archived run is a no-op that must not alter
         # any other data.
         if state.get("status") == "archived":
@@ -2428,6 +2701,7 @@ def cmd_accept_drift(args: argparse.Namespace) -> int:
     run_dir = run_ref.run_dir
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         require_active_run_state(state, run_ref.run_id, "accept-drift")
         old_baseline = dict(state.get("baseline", {}))
         old_repo_block = dict(state.get("repository", {}))
@@ -2531,6 +2805,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
     with RunStateLock(run_dir):
         state = load_run_state(run_dir)
+        verify_loaded_run_identity(state, run_dir=run_dir, expected_repo_id=repo.id)
         require_active_run_state(state, run_ref.run_id, "triage")
         require_no_unsafe_drift(state, repo)
         ledger = state.setdefault("review_ledger", [])
@@ -2833,7 +3108,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Migrate legacy .ai/autonomous-development state to new layout",
     )
     migrate.add_argument(
-        "--force", action="store_true", help="Overwrite existing new-format run"
+        "--target-run-id",
+        default=None,
+        help=(
+            "Migrate into this run ID instead of reusing the legacy run_id. Use "
+            "to migrate into a fresh, unused run when the default target is "
+            "already occupied. Must not name an existing run."
+        ),
+    )
+    migrate.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Accepted for compatibility. Never overwrites an existing run; an "
+            "occupied target still fails. Use --target-run-id to migrate "
+            "elsewhere."
+        ),
     )
     migrate.set_defaults(func=cmd_migrate_legacy_state)
 

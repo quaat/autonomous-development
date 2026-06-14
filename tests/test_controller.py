@@ -2002,6 +2002,63 @@ class TerminalStateIntegrityTests(unittest.TestCase):
             self.assertEqual(s["status"], "active")
         self.assertEqual(len(find_active_runs(state_home, repo_info.id)), 2)
 
+    def test_budget_exhaustion_does_not_overwrite_concurrent_cancel(self) -> None:
+        """When the review budget is exhausted, cmd_codex flips the run to
+        'blocked' under the lock. If a concurrent cancel makes the run terminal
+        first, that re-check inside the lock must refuse to overwrite it, so the
+        run stays byte-identical to the cancellation (no terminal-to-terminal
+        rewrite)."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        state_path = self.init_run(repo, state_home)
+        run_dir = state_path.parent
+
+        # Drive the run to the exhaustion boundary and satisfy the pre-budget
+        # review prerequisites (a plan artifact and a recorded check).
+        s = json.loads(state_path.read_text(encoding="utf-8"))
+        s["status"] = "active"
+        s["phase"] = "review"
+        s["review_round"] = 3
+        s["max_review_rounds"] = 3
+        s["verification"] = {
+            "checks": [{"name": "t", "command": ["true"], "exit_code": 0}]
+        }
+        state_path.write_text(json.dumps(s), encoding="utf-8")
+        (run_dir / "accepted-plan.md").write_text("PLAN\n", encoding="utf-8")
+
+        # The simulated concurrent cancel writes exactly this blob; the budget
+        # branch must add nothing further.
+        cancelled = json.loads(state_path.read_text(encoding="utf-8"))
+        cancelled["status"] = "cancelled"
+        cancelled["phase"] = "cancelled"
+        cancelled_bytes = json.dumps(cancelled).encode("utf-8")
+
+        original_lock = controller.RunStateLock
+
+        class FlipLock(original_lock):  # type: ignore[valid-type,misc]
+            def __enter__(self_inner):  # noqa: N805
+                entered = super().__enter__()
+                state_path.write_bytes(cancelled_bytes)
+                return entered
+
+        controller.RunStateLock = FlipLock
+        try:
+            args = argparse.Namespace(
+                project_root=str(repo),
+                state_dir=str(state_home),
+                run_id=None,
+                phase="review",
+                timeout=None,
+            )
+            with self.assertRaises(controller.WorkflowError) as ctx:
+                controller.cmd_codex(args)
+        finally:
+            controller.RunStateLock = original_lock
+
+        self.assertIn("terminal", str(ctx.exception).lower())
+        # The run equals exactly the cancellation; exhaustion wrote nothing.
+        self.assertEqual(state_path.read_bytes(), cancelled_bytes)
+
     # --- lifecycle-transition identity invariants (cancel/block/archive-run) ---
 
     # cancel/block require an active source; archive-run requires a terminal one.
@@ -2068,6 +2125,422 @@ class TerminalStateIntegrityTests(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0, result.stdout)
                     self.assertIn(expected, result.stderr)
                     self.assertEqual(state_path.read_bytes(), before)
+
+
+class LegacyMigrationIntegrityTests(unittest.TestCase):
+    """P0: `migrate-legacy-state` must be non-destructive, locked, and staged.
+
+    Migration may create a new-format run from legacy state, but it must never
+    overwrite an existing run (active or terminal), even with --force. A failed
+    conversion must leave no partially built run at the canonical path.
+    """
+
+    def setUp(self) -> None:
+        self._tmpdirs: list[Path] = []
+
+    def tearDown(self) -> None:
+        for d in self._tmpdirs:
+            if d.exists():
+                shutil.rmtree(str(d), ignore_errors=True)
+
+    def make_repo(self) -> Path:
+        temp = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(temp)
+        subprocess.run(["git", "init", "-q", str(temp)], check=True)
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.email", "test@example.com"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(temp), "config", "user.name", "Test User"], check=True
+        )
+        (temp / "README.md").write_text("# Test\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(temp), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(temp), "commit", "-qm", "initial"], check=True)
+        return temp
+
+    def make_state_home(self) -> Path:
+        d = Path(tempfile.mkdtemp())
+        self._tmpdirs.append(d)
+        return d
+
+    def run_controller(
+        self, repo: Path, *args: str, state_home: Path
+    ) -> subprocess.CompletedProcess[str]:
+        cmd = [
+            "python3", str(CONTROLLER),
+            "--project-root", str(repo),
+            "--state-dir", str(state_home),
+            *args,
+        ]
+        return subprocess.run(
+            cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+    def write_legacy_state(self, repo: Path, run_id: str) -> Path:
+        legacy_dir = repo / ".ai/autonomous-development"
+        legacy_dir.mkdir(parents=True, exist_ok=True)
+        (legacy_dir / "run-state.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "run_id": run_id,
+                    "status": "active",
+                    "phase": "implementation",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return legacy_dir
+
+    def runs_root(self, repo: Path, state_home: Path) -> Path:
+        repo_id = resolve_repository(repo).id
+        return state_home / "repositories" / repo_id / "runs"
+
+    def new_run_dir(self, repo: Path, state_home: Path, run_id: str) -> Path:
+        return self.runs_root(repo, state_home) / run_id
+
+    def init_run_with_id(
+        self, repo: Path, state_home: Path, run_id: str
+    ) -> Path:
+        res = self.run_controller(
+            repo, "--run-id", run_id, "init", "--feature", "F",
+            state_home=state_home,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return self.new_run_dir(repo, state_home, run_id) / "run-state.json"
+
+    # --- tests ---
+
+    def test_migrate_creates_run_from_legacy_source(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        legacy_dir = self.write_legacy_state(repo, "legacy-run-aaa")
+        legacy_before = (legacy_dir / "run-state.json").read_bytes()
+
+        res = self.run_controller(repo, "migrate-legacy-state", state_home=state_home)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+        published = self.new_run_dir(repo, state_home, "legacy-run-aaa") / "run-state.json"
+        self.assertTrue(published.exists())
+        s = json.loads(published.read_text(encoding="utf-8"))
+        self.assertEqual(s["run_id"], "legacy-run-aaa")
+        self.assertEqual(s["schema_version"], 2)
+        self.assertEqual(s["migrated_from"], str(legacy_dir))
+        # Original legacy state is untouched.
+        self.assertEqual((legacy_dir / "run-state.json").read_bytes(), legacy_before)
+        # No staging temp dir survives.
+        self.assertEqual(
+            list(self.runs_root(repo, state_home).glob(".migrate-*.tmp")), []
+        )
+
+    def test_migrate_is_idempotent_for_same_source(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.write_legacy_state(repo, "legacy-run-bbb")
+
+        first = self.run_controller(repo, "migrate-legacy-state", state_home=state_home)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        published = self.new_run_dir(repo, state_home, "legacy-run-bbb") / "run-state.json"
+        after_first = published.read_bytes()
+
+        second = self.run_controller(repo, "migrate-legacy-state", state_home=state_home)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("Already migrated", second.stdout)
+        # A re-run of the same source rewrites nothing.
+        self.assertEqual(published.read_bytes(), after_first)
+
+    def test_migrate_refuses_to_overwrite_existing_run(self) -> None:
+        """An init-created run occupying the legacy run_id must not be
+        overwritten, with or without --force; its bytes stay identical."""
+        for force in (False, True):
+            with self.subTest(force=force):
+                repo = self.make_repo()
+                state_home = self.make_state_home()
+                existing = self.init_run_with_id(repo, state_home, "collide-1")
+                before = existing.read_bytes()
+                self.write_legacy_state(repo, "collide-1")
+
+                argv = ["migrate-legacy-state"]
+                if force:
+                    argv.append("--force")
+                res = self.run_controller(repo, *argv, state_home=state_home)
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertIn("will not be overwritten", res.stderr)
+                self.assertEqual(existing.read_bytes(), before)
+
+    def test_migrate_force_cannot_overwrite_terminal_run(self) -> None:
+        """Every terminal target must remain byte-identical even under --force."""
+        for status in TERMINAL_STATUSES:
+            with self.subTest(status=status):
+                repo = self.make_repo()
+                state_home = self.make_state_home()
+                existing = self.init_run_with_id(repo, state_home, "collide-term")
+                s = json.loads(existing.read_text(encoding="utf-8"))
+                s["status"] = status
+                s["phase"] = status
+                existing.write_text(json.dumps(s), encoding="utf-8")
+                before = existing.read_bytes()
+                self.write_legacy_state(repo, "collide-term")
+
+                res = self.run_controller(
+                    repo, "migrate-legacy-state", "--force", state_home=state_home
+                )
+                self.assertNotEqual(res.returncode, 0, res.stdout)
+                self.assertEqual(existing.read_bytes(), before)
+
+    def test_target_run_id_migrates_into_fresh_run(self) -> None:
+        """--target-run-id lets an occupied default target be sidestepped: the
+        migration lands at the fresh id and the existing run is untouched."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        existing = self.init_run_with_id(repo, state_home, "collide-2")
+        before = existing.read_bytes()
+        self.write_legacy_state(repo, "collide-2")
+
+        res = self.run_controller(
+            repo, "migrate-legacy-state", "--target-run-id", "migrated-fresh",
+            state_home=state_home,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        fresh = self.new_run_dir(repo, state_home, "migrated-fresh") / "run-state.json"
+        self.assertTrue(fresh.exists())
+        self.assertEqual(
+            json.loads(fresh.read_text(encoding="utf-8"))["run_id"], "migrated-fresh"
+        )
+        self.assertEqual(existing.read_bytes(), before)
+
+    def test_failed_conversion_leaves_no_partial_run(self) -> None:
+        """If conversion raises mid-migration, no run may appear at the canonical
+        path and no staging temp dir may survive."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.write_legacy_state(repo, "legacy-run-ccc")
+        target = self.new_run_dir(repo, state_home, "legacy-run-ccc")
+
+        original = controller.migrate_v1_to_v2
+
+        def boom(*a, **k):
+            raise RuntimeError("conversion failed")
+
+        controller.migrate_v1_to_v2 = boom
+        try:
+            args = argparse.Namespace(
+                project_root=str(repo),
+                state_dir=str(state_home),
+                run_id=None,
+                target_run_id=None,
+                force=False,
+            )
+            with self.assertRaises(RuntimeError):
+                controller.cmd_migrate_legacy_state(args)
+        finally:
+            controller.migrate_v1_to_v2 = original
+
+        self.assertFalse(target.exists())
+        self.assertEqual(
+            list(self.runs_root(repo, state_home).glob(".migrate-*.tmp")), []
+        )
+
+    def test_concurrent_migration_and_init_stay_consistent(self) -> None:
+        """A migration and an `init --force` racing on the same repository are
+        serialized by the repository init lock: both publish intact runs, the
+        shared metadata stays valid JSON, and no staging temp dirs survive."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self.write_legacy_state(repo, "legacy-race")
+
+        def spawn(argv: list[str]) -> subprocess.Popen[str]:
+            cmd = [
+                "python3", str(CONTROLLER),
+                "--project-root", str(repo),
+                "--state-dir", str(state_home),
+                *argv,
+            ]
+            return subprocess.Popen(
+                cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+        p1 = spawn(["migrate-legacy-state"])
+        p2 = spawn(["init", "--feature", "race", "--force"])
+        out1 = p1.communicate()
+        out2 = p2.communicate()
+        self.assertEqual(p1.returncode, 0, out1)
+        self.assertEqual(p2.returncode, 0, out2)
+
+        repo_id = resolve_repository(repo).id
+        repo_dir = state_home / "repositories" / repo_id
+        meta = json.loads((repo_dir / "metadata.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["id"], repo_id)
+
+        runs = repo_dir / "runs"
+        self.assertEqual(list(runs.glob(".migrate-*.tmp")), [])
+        self.assertTrue((runs / "legacy-race" / "run-state.json").exists())
+        for d in [d for d in runs.iterdir() if d.is_dir()]:
+            json.loads((d / "run-state.json").read_text(encoding="utf-8"))
+
+
+class EvidencePreservingReviewTests(unittest.TestCase):
+    """W3: the cumulative review ledger preserves full evidence inline and the
+    acceptance-criteria ledger is cumulative."""
+
+    @staticmethod
+    def _finding(fid: str, severity: str = "high", **over: object) -> dict:
+        finding = {
+            "id": fid,
+            "severity": severity,
+            "category": "security",
+            "file": f"{fid}.py",
+            "line_start": 3,
+            "description": f"{fid} description",
+            "evidence": f"{fid} evidence",
+            "recommended_fix": f"{fid} fix",
+        }
+        finding.update(over)
+        return finding
+
+    _EVIDENCE_KEYS = ("file", "line_start", "description", "evidence", "recommended_fix")
+
+    def _assert_evidence(self, entry: dict, source: dict) -> None:
+        for key in self._EVIDENCE_KEYS:
+            self.assertEqual(entry[key], source[key], key)
+
+    def test_full_review_merge_preserves_evidence(self) -> None:
+        state: dict = {"cumulative_findings": []}
+        src = self._finding("F-1")
+        controller.merge_full_review(state, {"findings": [src]}, 1)
+        entry = state["cumulative_findings"][0]
+        self._assert_evidence(entry, src)
+        self.assertEqual(entry["origin"], "full")
+        self.assertEqual(entry["status"], "open")
+
+    def test_delta_merge_preserves_evidence_and_origin(self) -> None:
+        state: dict = {"cumulative_findings": [], "reviews": [{"delta": False}]}
+        controller.merge_full_review(state, {"findings": [self._finding("F-1")]}, 1)
+        new = self._finding("F-2", severity="critical")
+        regr = self._finding("F-3", severity="high")
+        controller.merge_delta_review(
+            state,
+            {
+                "resolved_findings": ["F-1"],
+                "new_findings": [new],
+                "regressions": [regr],
+            },
+            2,
+        )
+        by_id = {f["id"]: f for f in state["cumulative_findings"]}
+        self._assert_evidence(by_id["F-2"], new)
+        self.assertEqual(by_id["F-2"]["origin"], "delta")
+        self._assert_evidence(by_id["F-3"], regr)
+        self.assertEqual(by_id["F-3"]["origin"], "regression")
+        # A carried-forward finding keeps its evidence after being resolved.
+        self.assertEqual(by_id["F-1"]["status"], "resolved")
+        self.assertEqual(by_id["F-1"]["evidence"], "F-1 evidence")
+
+    def test_full_remap_collision_preserves_evidence_and_source_id(self) -> None:
+        state: dict = {"cumulative_findings": []}
+        a = self._finding("F-1", evidence="first")
+        b = self._finding("F-1", evidence="second")
+        controller.merge_full_review(state, {"findings": [a, b]}, 1)
+        findings = state["cumulative_findings"]
+        self.assertEqual(len(findings), 2)
+        remapped = [f for f in findings if f.get("source_id") == "F-1"][0]
+        self.assertNotEqual(remapped["id"], "F-1")
+        self.assertEqual(remapped["evidence"], "second")
+        self.assertEqual(remapped["origin"], "full")
+
+    def test_delta_remap_collision_preserves_evidence_and_source_id(self) -> None:
+        state: dict = {"cumulative_findings": [], "reviews": [{"delta": False}]}
+        controller.merge_full_review(state, {"findings": [self._finding("F-1")]}, 1)
+        clash = self._finding("F-1", evidence="delta-clash")
+        controller.merge_delta_review(state, {"new_findings": [clash]}, 2)
+        remapped = [
+            f for f in state["cumulative_findings"] if f.get("source_id") == "F-1"
+        ][0]
+        self.assertNotEqual(remapped["id"], "F-1")
+        self.assertEqual(remapped["evidence"], "delta-clash")
+        self.assertEqual(remapped["origin"], "delta")
+
+    def test_legacy_normalization_is_idempotent(self) -> None:
+        state: dict = {
+            "cumulative_findings": [
+                {"id": "F-1", "severity": "high", "status": "open"}
+            ],
+            "reviews": [{"delta": False}],
+        }
+        controller.merge_delta_review(state, {"new_findings": []}, 2)
+        entry = {f["id"]: f for f in state["cumulative_findings"]}["F-1"]
+        self.assertEqual(entry["origin"], "legacy")
+        self.assertIsNone(entry["file"])
+        self.assertIsNone(entry["line_start"])
+        self.assertEqual(entry["description"], "")
+        self.assertEqual(entry["evidence"], "")
+        self.assertEqual(entry["recommended_fix"], "")
+        # A second pass leaves the canonical shape unchanged.
+        before = json.dumps(state["cumulative_findings"], sort_keys=True)
+        controller.merge_delta_review(state, {"new_findings": []}, 3)
+        after = {f["id"]: f for f in state["cumulative_findings"]}["F-1"]
+        self.assertEqual(after["origin"], "legacy")
+        self.assertEqual(after["evidence"], "")
+        self.assertIn('"origin": "legacy"', before)
+
+    def test_render_open_findings_includes_evidence(self) -> None:
+        state: dict = {"cumulative_findings": []}
+        controller.merge_full_review(state, {"findings": [self._finding("F-1")]}, 1)
+        rendered = controller.render_open_findings(state)
+        parsed = json.loads(rendered)
+        self.assertEqual(parsed[0]["file"], "F-1.py")
+        self.assertEqual(parsed[0]["evidence"], "F-1 evidence")
+        self.assertEqual(parsed[0]["recommended_fix"], "F-1 fix")
+        self.assertEqual(parsed[0]["description"], "F-1 description")
+
+    def test_acceptance_criteria_ledger_seed_and_delta_update(self) -> None:
+        state: dict = {"cumulative_acceptance_criteria": []}
+        controller.merge_acceptance_criteria(
+            state,
+            {
+                "acceptance_criteria_assessment": [
+                    {"id": "AC-1", "status": "satisfied", "evidence": "ev1"},
+                    {"id": "AC-2", "status": "not_satisfied", "evidence": "ev2"},
+                ]
+            },
+            1,
+        )
+        controller.merge_acceptance_criteria(
+            state,
+            {
+                "affected_acceptance_criteria": [
+                    {"id": "AC-2", "status": "satisfied", "evidence": "ev2b"}
+                ]
+            },
+            2,
+        )
+        by_id = {c["id"]: c for c in state["cumulative_acceptance_criteria"]}
+        self.assertEqual(by_id["AC-1"]["status"], "satisfied")
+        self.assertEqual(by_id["AC-1"]["round"], 1)
+        self.assertEqual(by_id["AC-2"]["status"], "satisfied")
+        self.assertEqual(by_id["AC-2"]["evidence"], "ev2b")
+        self.assertEqual(by_id["AC-2"]["round"], 2)
+
+    def test_describe_blocking_findings_lists_ids(self) -> None:
+        state: dict = {"cumulative_findings": []}
+        controller.merge_full_review(
+            state,
+            {
+                "findings": [
+                    self._finding("F-1", severity="critical"),
+                    self._finding("F-2", severity="high"),
+                ]
+            },
+            1,
+        )
+        severe = controller.cumulative_unresolved_severe(state)
+        described = controller._describe_blocking_findings(severe)
+        self.assertIn("F-1", described)
+        self.assertIn("critical", described)
+        self.assertIn("F-2", described)
+        # block/pass detection itself is unchanged: both are still severe+open.
+        self.assertEqual(len(severe), 2)
 
 
 if __name__ == "__main__":

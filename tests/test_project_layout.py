@@ -74,6 +74,7 @@ class ProjectLayoutTests(unittest.TestCase):
             "LATEST_REVIEW",
             "FINDING_LEDGER",
             "OPEN_FINDINGS",
+            "ACCEPTANCE_CRITERIA",
         }
         import re
 

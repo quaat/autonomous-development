@@ -3,6 +3,27 @@
 ## Unreleased
 
 ### Added
+- Evidence-preserving cumulative review ledger: each entry in `cumulative_findings`
+  now stores the full review evidence inline (`file`, `line_start`, `description`,
+  `evidence`, `recommended_fix`) plus an `origin` provenance tag
+  (`full`/`delta`/`regression`/`legacy`), so the ledger is self-contained — the
+  completion gate, the audit trail, and the delta reviewer no longer need to
+  re-open the raw `review-NN.codex.json`. Legacy entries are normalized to this
+  shape on the next merge (idempotent backfill with null/"" defaults)
+- Cumulative acceptance-criteria ledger (`cumulative_acceptance_criteria`): the full
+  review's `acceptance_criteria_assessment` and each delta's
+  `affected_acceptance_criteria` are merged into an id-keyed ledger keeping the
+  latest `{id, status, evidence, round}` per criterion. Surfaced to the delta
+  reviewer via a new `ACCEPTANCE CRITERIA (cumulative)` section in
+  `prompts/code-review-delta.md`. The completion gate does **not** yet block on
+  acceptance-criteria status — this only persists evidence that was previously
+  discarded (a gate condition is a possible follow-up)
+- Delta-review prompt now lists each open finding with its full evidence (not just
+  `id`/`severity`), so a prior finding can be resolved or carried from the prompt
+  alone
+- Gate failure reasons now name the blocking findings (id, severity, category, and a
+  short description snippet) instead of only counting them; the block/pass decision
+  is unchanged
 - Token instrumentation: `codex` phases run with `codex exec --json`, retain the NDJSON
   event stream (`*.events.ndjson`), and record a per-phase usage block
   (`prompt_characters`, `output_characters`, `duration_seconds`, `model`,
@@ -34,6 +55,19 @@
   modules/test roots/CI) instead of the first 250 tracked file names; latest-only
   verification checks; finding ledger instead of full prior review/triage prose
 - `skills/autonomous-feature/SKILL.md` slimmed to a state-machine driver (`effort: high`)
+- `migrate-legacy-state` is now non-destructive and crash-safe under contention: the
+  migrated run is staged in a temporary sibling directory and atomically renamed into
+  place under the repository init lock. An occupied target is never overwritten — re-running
+  the same source is an idempotent no-op, any other occupant fails the command, and
+  `--force` no longer authorizes overwrite (it cannot bypass run immutability). Use the new
+  `--target-run-id` to migrate into a fresh, unused run id instead.
+
+### Known limitations
+- `accept` artifact publication is exception-safe (it rolls back staged/backup files on a
+  raised error) but not crash-safe: a process kill or power loss between backup creation,
+  artifact publication, and state save can leave `.bak` files, a missing canonical artifact,
+  or artifacts newer than `run-state.json`. Hardening this with a transaction journal and
+  recovery-on-load is tracked as a separate P1 item.
 
 ## 0.2.0 - 2026-06-12
 

@@ -654,6 +654,80 @@ class StateModuleTests(unittest.TestCase):
             held.__exit__()
             CrossProcessLock.force_backend = original
 
+    def test_portable_release_does_not_delete_a_replacement_lock(self) -> None:
+        """If a portable holder's lock file is removed and another holder creates
+        a fresh lock at the same path, the original holder's release must not
+        unlink the replacement (a different inode it does not own). Otherwise a
+        third process could enter while the replacement holder believes it still
+        owns the lock."""
+        lock_dir = self._tmpdir()
+        lock_path = lock_dir / ".x.lock"
+        original = CrossProcessLock.force_backend
+        CrossProcessLock.force_backend = "portable"
+        held = CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01)
+        other = CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01)
+        try:
+            held.__enter__()
+            # The original lock file is removed out-of-band, then a different
+            # holder acquires a brand-new lock at the same path.
+            lock_path.unlink()
+            other.__enter__()
+            replacement_token = json.loads(
+                lock_path.read_text(encoding="utf-8")
+            )["token"]
+            self.assertNotEqual(replacement_token, held._owner_token)
+
+            # Releasing the stale original must leave the replacement intact.
+            held.__exit__()
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(
+                json.loads(lock_path.read_text(encoding="utf-8"))["token"],
+                replacement_token,
+            )
+        finally:
+            other.__exit__()
+            CrossProcessLock.force_backend = original
+
+    def test_portable_release_does_not_delete_in_place_token_rewrite(self) -> None:
+        """If the lock file keeps its inode but its owner token is rewritten in
+        place by another holder, release must still refuse to unlink it: the
+        recorded owner no longer matches this instance."""
+        lock_dir = self._tmpdir()
+        lock_path = lock_dir / ".x.lock"
+        original = CrossProcessLock.force_backend
+        CrossProcessLock.force_backend = "portable"
+        held = CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01)
+        try:
+            held.__enter__()
+            # Same file (same inode), but the owner metadata is replaced.
+            lock_path.write_text(
+                json.dumps({"token": "someone-elses-token"}), encoding="utf-8"
+            )
+            held.__exit__()
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(
+                json.loads(lock_path.read_text(encoding="utf-8"))["token"],
+                "someone-elses-token",
+            )
+        finally:
+            if lock_path.exists():
+                lock_path.unlink()
+            CrossProcessLock.force_backend = original
+
+    def test_portable_release_unlinks_own_unmodified_lock(self) -> None:
+        """The normal path: a portable holder that still owns its untouched lock
+        file removes it on release so the next acquirer can proceed."""
+        lock_dir = self._tmpdir()
+        lock_path = lock_dir / ".x.lock"
+        original = CrossProcessLock.force_backend
+        CrossProcessLock.force_backend = "portable"
+        try:
+            with CrossProcessLock(lock_path, timeout=0.05, poll_interval=0.01):
+                self.assertTrue(lock_path.exists())
+            self.assertFalse(lock_path.exists())
+        finally:
+            CrossProcessLock.force_backend = original
+
     # -----------------------------------------------------------------------
     # 19. legacy state detection
     # -----------------------------------------------------------------------

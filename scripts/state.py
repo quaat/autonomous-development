@@ -477,8 +477,39 @@ class CrossProcessLock:
                     raise self._timeout_error()
                 time.sleep(self._poll)
 
+    def _portable_lock_is_ours(self, fd: int) -> bool:
+        """Whether the file at the lock path is still the one we created.
+
+        Guards the release race: if our lock file is removed and another
+        process recreates the path, the replacement is a *different* inode (and
+        carries a different owner token). Deleting it would evict a lock we do
+        not hold. The fstat happens before the descriptor is closed so the inode
+        we created stays pinned and cannot be reused underneath us.
+        """
+        try:
+            fd_stat = os.fstat(fd)
+            path_stat = os.stat(self._lock_path)
+        except OSError:
+            # Path is gone or unreadable: nothing of ours to unlink.
+            return False
+        if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+            # A different file now occupies the path; it belongs to someone else.
+            return False
+        try:
+            info = json.loads(self._lock_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # Metadata unreadable (our best-effort stamp may have failed). Inode
+            # identity already proved this is the file we created, so honor it.
+            return True
+        # Same inode but rewritten owner token means the content was replaced in
+        # place by another holder; do not unlink it.
+        return info.get("token") == self._owner_token
+
     def __exit__(self, *args: object) -> None:
+        safe_to_unlink = False
         if self._fd is not None:
+            if self._backend == "portable" and self._holds_exclusive_file:
+                safe_to_unlink = self._portable_lock_is_ours(self._fd)
             try:
                 if self._backend == "fcntl":
                     _fcntl.flock(self._fd, _fcntl.LOCK_UN)
@@ -491,10 +522,11 @@ class CrossProcessLock:
                 os.close(self._fd)
                 self._fd = None
         if self._holds_exclusive_file:
-            try:
-                self._lock_path.unlink()
-            except FileNotFoundError:
-                pass
+            if safe_to_unlink:
+                try:
+                    self._lock_path.unlink()
+                except FileNotFoundError:
+                    pass
             self._holds_exclusive_file = False
 
 
@@ -865,37 +897,49 @@ def require_active_run_state(state: dict, run_id: str, operation: str) -> None:
     _reject_non_active(run_id, state.get("status"), operation)
 
 
-def verify_run_identity(ref: RunRef, repo_id: str) -> None:
-    """Enforce run-identity invariants for the external state layout.
+def verify_loaded_run_identity(
+    state: dict, *, run_dir: Path, expected_repo_id: str
+) -> None:
+    """Enforce run-identity invariants on a freshly loaded state dict.
 
     state.run_id must equal the run directory name and state.repository.id must
     match the selected repository, so a tampered or misfiled run-state cannot be
-    mutated under the wrong identity. The legacy in-repo layout (run_dir is the
-    `.ai/autonomous-development` directory, not `runs/<run_id>`) is exempt.
+    mutated under the wrong identity. Operates on the exact state object being
+    mutated so it can be re-asserted *under the lock* after every reload (defense
+    in depth), not only at pre-lock resolution. The legacy in-repo layout
+    (run_dir is the `.ai/autonomous-development` directory, not `runs/<run_id>`)
+    is exempt.
     """
-    if ref.run_dir.parent.name != "runs":
+    if run_dir.parent.name != "runs":
         return  # legacy compatibility path
-    recorded_id = ref.state.get("run_id")
-    if recorded_id != ref.run_dir.name:
+    recorded_id = state.get("run_id")
+    if recorded_id != run_dir.name:
         raise StateError(
             f"State integrity error: run-state run_id {recorded_id!r} does not "
-            f"match its run directory name {ref.run_dir.name!r}."
+            f"match its run directory name {run_dir.name!r}."
         )
-    recorded_repo = ref.state.get("repository", {})
+    recorded_repo = state.get("repository", {})
     recorded_repo_id = (
         recorded_repo.get("id") if isinstance(recorded_repo, dict) else None
     )
     if not recorded_repo_id:
         raise StateError(
-            f"State integrity error: run {ref.run_dir.name!r} does not record a "
+            f"State integrity error: run {run_dir.name!r} does not record a "
             f"repository id; an external-layout run must be bound to its "
             f"repository before it can be mutated."
         )
-    if recorded_repo_id != repo_id:
+    if recorded_repo_id != expected_repo_id:
         raise StateError(
-            f"State integrity error: run {ref.run_dir.name!r} records repository "
-            f"{recorded_repo_id!r} but the current repository is {repo_id!r}."
+            f"State integrity error: run {run_dir.name!r} records repository "
+            f"{recorded_repo_id!r} but the current repository is {expected_repo_id!r}."
         )
+
+
+def verify_run_identity(ref: RunRef, repo_id: str) -> None:
+    """Enforce run-identity invariants for a resolved RunRef (pre-lock check)."""
+    verify_loaded_run_identity(
+        ref.state, run_dir=ref.run_dir, expected_repo_id=repo_id
+    )
 
 
 def assert_transition_allowed(
