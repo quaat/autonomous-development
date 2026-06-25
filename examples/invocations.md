@@ -31,6 +31,10 @@ controller.py init --feature "Rename a button label" --mode auto
 
 # Force the full workflow with mandatory adversarial review.
 controller.py init --feature "Add tenant-scoped billing" --mode rigorous
+
+# Use your manually created feature branch instead of a disposable worktree.
+git switch -c experiment
+controller.py init --feature "Experiment feature" --mode auto --worktree-mode current
 ```
 
 Drive phases and inspect token usage:

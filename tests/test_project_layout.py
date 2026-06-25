@@ -85,6 +85,15 @@ class ProjectLayoutTests(unittest.TestCase):
             )
             self.assertTrue(placeholders <= known, f"{path}: {placeholders - known}")
 
+    def test_autonomous_feature_skill_mentions_worktree_modes(self) -> None:
+        text = (ROOT / "skills" / "autonomous-feature" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--worktree-mode isolated", text)
+        self.assertIn("--worktree-mode current", text)
+        self.assertIn("EnterWorktree", text)
+        self.assertIn("current-checkout mode", text)
+
 
 if __name__ == "__main__":
     unittest.main()

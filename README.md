@@ -21,6 +21,10 @@ The main entry point is:
 
 The plugin deliberately keeps Claude as the implementation orchestrator and uses fresh, read-only Codex executions for independent planning and review. It does not push, merge, deploy, rotate credentials, alter remote infrastructure, or apply irreversible production migrations.
 
+## Upstream
+
+This plugin is based on [quaat/autonomous-development](https://github.com/quaat/autonomous-development). This fork keeps the original workflow and adds the current-checkout mode and related documentation updates.
+
 ## Included skills
 
 | Skill | Purpose |
@@ -286,19 +290,32 @@ Archiving is a metadata flag; no files are deleted.
 - Do not share state directories across users or store them on world-readable paths.
 - Remote URLs are stored with credentials stripped (the `user:pass@` portion is removed).
 
-## Worktree support
+## Worktree modes
 
-All commands work correctly from any linked worktree. The repository identity is derived from
-the shared git object store so runs created in different worktrees belong to the same
-repository and are visible to `list-runs`.
+The controller supports two explicit execution modes:
 
 ```bash
-# Create a linked worktree and run the workflow there
-git worktree add ../experiment feature-branch
-cd ../experiment
-controller.py init --feature "Experiment feature"
-# State stored under the same repository ID, new run ID
+# Default safe workflow: isolated worktree
+# Claude Code's autonomous-feature skill enters a disposable worktree before init.
+controller.py init --feature "Experiment feature" --mode auto --worktree-mode isolated
 ```
+
+```bash
+# Current-branch workflow: use the branch you created manually
+git checkout -b experiment
+controller.py init --feature "Experiment feature" --mode auto --worktree-mode current
+# Review the result with normal `git diff` in your checkout.
+```
+
+All commands still work correctly from any linked worktree. The repository identity is derived
+from the shared git object store so runs created in different worktrees belong to the same
+repository and are visible to `list-runs`. Current-checkout mode is opt-in for people who create
+their own feature branches first and want the agent's changes to land directly in that checkout, so
+normal `git diff`, local testing, and manual commit flow continue to work. In current mode the
+controller uses the current project root for both `repository.canonical_root` and
+`repository.worktree_path`, records the current branch in baseline metadata, does not create a
+`.claude/worktrees/*` worktree or `worktree-*` branch, refuses `main`/`master` unless you pass
+`--allow-main`, and refuses a dirty tree.
 
 ## Completion rules
 
@@ -323,7 +340,7 @@ The skill uses Codex with `--sandbox read-only`. Claude performs repository edit
 - deleting unrelated user changes;
 - weakening tests or security controls to obtain a passing result.
 
-Run autonomous development in a disposable branch or worktree. The orchestrator asks Claude Code to use an isolated worktree whenever supported.
+By default, run autonomous development in an isolated worktree. This fork also supports an explicit current-checkout mode when you want changes to land directly in your own feature branch.
 
 ## Customization
 

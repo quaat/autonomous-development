@@ -81,6 +81,22 @@ class ControllerTests(unittest.TestCase):
             )
         return active[0].run_dir / "run-state.json"
 
+    def _current_branch(self, repo: Path) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--show-current"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def _checkout_feature_branch(self, repo: Path, name: str = "feature-branch") -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), "checkout", "-q", "-b", name],
+            check=True,
+        )
+
     def test_init_and_status(self) -> None:
         repo = self.make_repo()
         state_home = self.make_state_home()
@@ -99,6 +115,113 @@ class ControllerTests(unittest.TestCase):
         status = self.run_controller(repo, "status", state_home=state_home)
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertIn("Phase: initialized", status.stdout)
+        self.assertIn("Worktree mode: isolated worktree", status.stdout)
+        self.assertEqual(state["repository"]["worktree_mode"], "isolated")
+
+    def test_init_current_mode_records_current_checkout_path(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self._checkout_feature_branch(repo)
+
+        result = self.run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Feature",
+            "--worktree-mode",
+            "current",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        state_path = self._find_state_path(repo, state_home)
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["repository"]["canonical_root"], str(repo.resolve()))
+        self.assertEqual(state["repository"]["worktree_path"], str(repo.resolve()))
+        self.assertEqual(state["repository"]["worktree_mode"], "current")
+        self.assertEqual(state["baseline"]["branch"], self._current_branch(repo))
+
+        status = self.run_controller(repo, "status", state_home=state_home)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("Worktree mode: current checkout", status.stdout)
+
+    def test_current_mode_refuses_main_and_master(self) -> None:
+        for branch_name in ("main", "master"):
+            with self.subTest(branch=branch_name):
+                repo = self.make_repo()
+                state_home = self.make_state_home()
+                subprocess.run(
+                    ["git", "-C", str(repo), "branch", "-m", branch_name],
+                    check=True,
+                )
+                result = self.run_controller(
+                    repo,
+                    "init",
+                    "--feature",
+                    "Feature",
+                    "--worktree-mode",
+                    "current",
+                    state_home=state_home,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(branch_name, result.stderr)
+
+    def test_current_mode_allows_main_and_master_with_override(self) -> None:
+        for branch_name in ("main", "master"):
+            with self.subTest(branch=branch_name):
+                repo = self.make_repo()
+                state_home = self.make_state_home()
+                subprocess.run(
+                    ["git", "-C", str(repo), "branch", "-m", branch_name],
+                    check=True,
+                )
+                result = self.run_controller(
+                    repo,
+                    "init",
+                    "--feature",
+                    "Feature",
+                    "--worktree-mode",
+                    "current",
+                    "--allow-main",
+                    state_home=state_home,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_current_mode_refuses_dirty_tree(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self._checkout_feature_branch(repo)
+        (repo / "README.md").write_text("# dirty\n", encoding="utf-8")
+
+        result = self.run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Feature",
+            "--worktree-mode",
+            "current",
+            state_home=state_home,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("clean working tree", result.stderr)
+
+    def test_current_mode_does_not_create_claude_worktrees(self) -> None:
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+        self._checkout_feature_branch(repo)
+        worktrees_dir = repo / ".claude" / "worktrees"
+
+        result = self.run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Feature",
+            "--worktree-mode",
+            "current",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(worktrees_dir.exists())
 
     def test_record_passing_check(self) -> None:
         repo = self.make_repo()
