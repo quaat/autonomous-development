@@ -1,7 +1,21 @@
 # Example invocations
 
 ```text
+# Safe default: edits land in a disposable isolated worktree.
 /autonomous-development:autonomous-feature "Add resumable multipart uploads with checksum validation and backward-compatible API behavior"
+```
+
+```text
+# Direct edits on an already-created feature branch.
+# Refuses main/master and a dirty tree. Never commits — review with `git diff`.
+git checkout -b feature/uploads
+/autonomous-development:autonomous-current "Add resumable multipart uploads"
+```
+
+```text
+# Explicit opt-in: direct edits on main/master.
+# Still requires a clean tree. Never commits — review with `git diff`.
+/autonomous-development:autonomous-main "Patch a security hotfix in place"
 ```
 
 ```text
@@ -35,6 +49,9 @@ controller.py init --feature "Add tenant-scoped billing" --mode rigorous
 # Use your manually created feature branch instead of a disposable worktree.
 git switch -c experiment
 controller.py init --feature "Experiment feature" --mode auto --worktree-mode current
+
+# Same mode, but explicitly authorized to land on main/master.
+controller.py init --feature "Hotfix" --mode standard --worktree-mode current --allow-main
 ```
 
 Drive phases and inspect token usage:

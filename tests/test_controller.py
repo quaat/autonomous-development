@@ -223,6 +223,50 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(worktrees_dir.exists())
 
+    def test_current_mode_with_allow_main_does_not_create_claude_worktrees(self) -> None:
+        """The /autonomous-development:autonomous-main wrapper passes --allow-main; it
+        must still skip the disposable-worktree path."""
+        for branch_name in ("main", "master"):
+            with self.subTest(branch=branch_name):
+                repo = self.make_repo()
+                state_home = self.make_state_home()
+                subprocess.run(
+                    ["git", "-C", str(repo), "branch", "-m", branch_name],
+                    check=True,
+                )
+                worktrees_dir = repo / ".claude" / "worktrees"
+
+                result = self.run_controller(
+                    repo,
+                    "init",
+                    "--feature",
+                    "Feature",
+                    "--worktree-mode",
+                    "current",
+                    "--allow-main",
+                    state_home=state_home,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse(worktrees_dir.exists())
+
+    def test_isolated_default_unchanged_for_autonomous_feature(self) -> None:
+        """The /autonomous-development:autonomous-feature wrapper relies on the default
+        worktree-mode staying `isolated` and on the run state recording it as such."""
+        repo = self.make_repo()
+        state_home = self.make_state_home()
+
+        # No --worktree-mode → relies on the default.
+        result = self.run_controller(
+            repo,
+            "init",
+            "--feature",
+            "Feature",
+            state_home=state_home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self._find_state_path(repo, state_home).read_text(encoding="utf-8"))
+        self.assertEqual(state["repository"]["worktree_mode"], "isolated")
+
     def test_record_passing_check(self) -> None:
         repo = self.make_repo()
         state_home = self.make_state_home()
